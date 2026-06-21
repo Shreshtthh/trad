@@ -162,7 +162,7 @@ else
     if [[ ! $REPLY =~ ^[Yy]$ ]]; then
         info "Skipped registration."
     else
-        $TWA_BIN compete register --contract "$COMPETITION_CONTRACT" 2>&1 || {
+        $TWA_BIN compete register 2>&1 || {
             err "Registration failed. Check TWAK docs or run with --check first."
             info "Manual registration: $TWA_BIN compete register"
             exit 1
