@@ -11,8 +11,9 @@ Flow (called every 15 min by main.py):
 3. Gate 1: Friction Floor — must have ≥1.25% 1h momentum to clear fees
 4. Gate 2: Freshness Multiplier — slingshot vs ignition vs exhausted
 5. Gate 3: Liquidity — minimum $100k 24h volume
-6. Gate 4: Climax Exhaustion — reject tokens already up >40% in 24h
-7. Cross-sectional ranking by acceleration score → top 2 candidates
+6. Gate 4: Climax Exhaustion (24h) — reject tokens already up >40%
+7. Gate 5: Hourly Climax — reject tokens up >30% in a single hour
+8. Cross-sectional ranking by acceleration score → top 2 candidates
 """
 
 import logging
@@ -45,6 +46,7 @@ SCAN_LIST: set[str] = _build_scan_list()
 FRICTION_FLOOR_PCT = 1.25       # Must beat round-trip fees (~0.55%) in 1h alone with margin
 MIN_VOLUME_24H = 100_000        # Minimum 24h volume to avoid shallow pools
 CLIMAX_EXHAUSTION_PCT = 40.0    # Reject if 24h gain >40% (blow-off top)
+HOURLY_CLIMAX_PCT = 30.0         # Reject if 1h gain >30% (intra-hour blow-off)
 FRESHNESS_MIN = 0.20            # Below 0.20 = exhausted pump, reject
 
 # ── Data model ──
@@ -138,7 +140,9 @@ def discover_candidates(
     # Step 3 — Score each token
     scored: list[MomentumCandidate] = []
     for sym in SCAN_LIST:
-        q = quotes.get(sym)
+        # CMC uppercases all response keys, but SCAN_LIST preserves
+        # allowlist case (e.g., "BabyDoge", "XAUt"). Always lookup by upper.
+        q = quotes.get(sym.upper())
         if not q:
             continue
 
@@ -220,9 +224,17 @@ def _score_token(
         log.debug("Alpha rejected %s: low volume ($%.0f)", sym, vol_24h)
         return None
 
-    # ── Gate 4: Climax Exhaustion ──
+    # ── Gate 4: Climax Exhaustion (24h) ──
     if pct_24h > CLIMAX_EXHAUSTION_PCT:
         log.debug("Alpha rejected %s: climax exhaustion (+%.1f%%)", sym, pct_24h)
+        return None
+
+    # ── Gate 5: Hourly Climax ──
+    # A token pumping >30% in a single hour is a blow-off, even
+    # if the 24h number looks innocent. SIREN +91.3% 1h is the
+    # canonical example: massive hourly candle = manipulation.
+    if pct_1h > HOURLY_CLIMAX_PCT:
+        log.debug("Alpha rejected %s: hourly blow-off (+%.1f%% 1h)", sym, pct_1h)
         return None
 
     # ── Acceleration Score ──

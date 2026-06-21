@@ -182,7 +182,7 @@ def validate_regime_response(parsed: dict) -> dict:
         allocation_pct = max(allocation_pct, 0.35)
     elif regime == "risk_off":
         max_positions = min(max_positions, 2)
-        allocation_pct = min(allocation_pct, 0.20)
+        allocation_pct = min(allocation_pct, 0.15)
 
     return {
         "regime": regime,
