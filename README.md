@@ -1,4 +1,5 @@
-# Freshness Ratio Alpha -- Autonomous Momentum Rotation Agent
+# Kinetix
+## Freshness Ratio Alpha -- Autonomous Momentum Rotation Agent
 
 **BNB Hack: AI Trading Agent Edition -- June 2026**
 **Dual-track submission: Track 1 (Autonomous Trading) + Track 2 (Strategy Skill)**
@@ -590,4 +591,3 @@ MIT
 
 ---
 
-Built with [Claude Code](https://claude.com/claude-code)
