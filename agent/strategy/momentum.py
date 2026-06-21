@@ -304,15 +304,17 @@ _FALLBACK_LIQUID: list[str] = [
 
 
 def _fallback_liquid_scan(
-    cmc_fetch,  # callable(symbols, interval, count) → dict[str, list[dict]]
+    cmc_fetch,  # callable(symbols, interval, count) → dict[str, dict] (quotes-based)
     regime: str,
     hot_sectors: Optional[set[str]],
     top_n: int,
 ) -> MomentumResult:
     """
-    Fallback: fetch 24h k-line data for liquid allowlist tokens and compute
-    simple momentum scores. Used when the MCP breakout scanner returns zero
-    eligible BSC tokens.
+    Fallback: fetch latest quotes for liquid allowlist tokens and score
+    by 24h momentum. Uses /v2/cryptocurrency/quotes/latest (Basic-tier compatible).
+
+    The old version used k-line/OHLCV which requires CMC Standard tier ($299/mo).
+    Quotes/latest gives us percent_change_24h directly — one API call instead of 23.
     """
     import time as _time
     t0 = _time.monotonic()
@@ -320,37 +322,84 @@ def _fallback_liquid_scan(
     result = MomentumResult(raw_scanned=len(_FALLBACK_LIQUID))
 
     try:
-        kline_data = cmc_fetch(_FALLBACK_LIQUID, "1d", 2)  # 2 daily candles
+        quotes_data = cmc_fetch(_FALLBACK_LIQUID, None, None)  # interval/count ignored
     except Exception as exc:
-        log.error("Fallback k-line fetch failed: %s", exc)
-        result.error = f"Fallback k-line fetch failed: {exc}"
+        log.error("Fallback quotes fetch failed: %s", exc)
+        result.error = f"Fallback quotes fetch failed: {exc}"
+        return result
+
+    if not quotes_data:
+        log.warning("Fallback quotes returned empty — CMC quotes/latest may be unavailable")
+        result.error = "Fallback quotes returned empty"
         return result
 
     candidates: list[MomentumCandidate] = []
     for sym in _FALLBACK_LIQUID:
-        points = kline_data.get(sym, [])
-        if len(points) < 2:
+        q = quotes_data.get(sym)
+        if not q:
             continue
 
-        # Simple 24h momentum: (close_now - close_24h_ago) / close_24h_ago
-        try:
-            prev_close = float(points[0]["quote"]["USD"]["close"])
-            curr_close = float(points[1]["quote"]["USD"]["close"])
-            if prev_close <= 0:
-                continue
-            pct_24h = ((curr_close - prev_close) / prev_close) * 100
-        except (KeyError, TypeError, ValueError):
-            continue
+        pct_24h = q.get("percent_change_24h", 0)
+        price = q.get("price", 0)
+        vol_24h = q.get("volume_24h", 0)
+        vol_chg_24h = q.get("volume_change_24h", 0)
 
+        if price <= 0:
+            continue
         if pct_24h <= 0:
             continue  # Only positive momentum in fallback mode
 
+        # ── Volume confirmation ──
+        # Price up on falling volume = fakeout / low-liquidity chop.
+        # Require volume to be stable or expanding.
+        if vol_chg_24h < 0:
+            log.debug(
+                "Fallback dropped %s: +%.1f%% price but %.0f%% vol drop — unconfirmed",
+                sym, pct_24h, vol_chg_24h,
+            )
+            continue
+
+        # ── Entry cap ──
+        # Don't chase tokens already up >8% — mean reversion risk too high.
+        if pct_24h > 8:
+            log.debug(
+                "Fallback dropped %s: +%.1f%% exceeds 8%% entry cap",
+                sym, pct_24h,
+            )
+            continue
+
+        # ── Friction-aware minimum threshold ──
+        # Round-trip: entry (1.5% slippage) + exit (1.5% slippage) = ~3% floor.
+        # We need to clear friction with margin. Threshold scales by regime:
+        #   risk_on:  3% — market trending, lower bar
+        #   neutral:  3.5% — baseline, clears friction with slim margin
+        #   risk_off: 5% — only strong momentum worth the risk in a bear market
+        thresholds = {"risk_on": 3.0, "neutral": 3.5, "risk_off": 5.0}
+        threshold = thresholds.get(regime, 3.5)
+        if pct_24h < threshold:
+            log.debug(
+                "Fallback dropped %s: +%.1f%% below %.0f%% threshold (regime=%s)",
+                sym, pct_24h, threshold, regime,
+            )
+            continue
+
+        # Composite: base on 24h price gain, normalized to 0-1 scale.
+        # Volume-confirmed moves get a small boost.
+        composite = pct_24h / 100
+        vol_factor = min(vol_chg_24h / 100, 0.15)  # up to 15% bonus for strong volume
+        composite += max(0, vol_factor)
+        composite = min(composite, 1.0)
+
+        flags = []
+        if vol_chg_24h >= 20:
+            flags.append("vol_strong")
         cand = MomentumCandidate(
             symbol=sym,
-            composite_score=pct_24h / 100,  # normalize to ~0-1 scale
+            composite_score=composite,
             price_change_24h_pct=pct_24h,
+            volume_change_24h_pct=vol_chg_24h,
             sector=get_cmc_sector(sym),
-            reason=f"fallback: 24h_momentum={pct_24h:.1f}%",
+            reason=f"fallback: 24h_momentum={pct_24h:+.1f}% vol={vol_chg_24h:+.0f}% {' '.join(flags)}".strip(),
         )
         candidates.append(cand)
 
@@ -407,14 +456,21 @@ def _apply_regime_gate(
         return passed
 
     if regime == "risk_off":
-        # Strict: only hot-sector tokens with strong composite scores
+        # Friction-aware: only tokens strong enough to clear round-trip costs.
+        # Round-trip = entry (1.5%) + exit (1.5%) = 3% floor.
+        # Require ≥3% gain to have any profit margin.
         passed = []
+        has_hot = bool(hot_sectors)
         for c in candidates:
-            if c.sector is not None and c.sector in hot_sectors and c.composite_score >= 0.4:
+            if c.composite_score >= 0.03:  # ≥3% gain clears friction
+                if has_hot and c.sector is not None and c.sector not in hot_sectors:
+                    log.debug("Regime gate (risk_off) dropped %s (sector=%s, not hot)",
+                              c.symbol, c.sector)
+                    continue
                 passed.append(c)
             else:
-                log.debug("Regime gate (risk_off) dropped %s (sector=%s, score=%.3f)",
-                          c.symbol, c.sector, c.composite_score)
+                log.debug("Regime gate (risk_off) dropped %s (score=%.3f < 0.03)",
+                          c.symbol, c.composite_score)
         return passed
 
     return candidates
