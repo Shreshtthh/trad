@@ -240,14 +240,18 @@ def check_quota(state: dict) -> GuardResult:
 
 # ── State mutation helpers (called by orchestrator after execution) ──────
 
-def record_trade(state: dict, trade_result) -> dict:
+def record_trade(state: dict, trade_result, *, quota_exempt: bool = False) -> dict:
     """
     Update state after a successful trade.
 
-    Increments trades_today, updates last_trade_ts, and bumps peak if needed.
-    Mutates state in place and returns it.
+    Increments trades_today (unless quota_exempt), updates last_trade_ts,
+    and bumps peak if needed. Mutates state in place and returns it.
+
+    quota_exempt=True is used for circuit breaker exits — protective stops
+    should never count against the 5/day trading cap.
     """
-    state["trades_today"] = state.get("trades_today", 0) + 1
+    if not quota_exempt:
+        state["trades_today"] = state.get("trades_today", 0) + 1
     state["last_trade_ts"] = datetime.now(timezone.utc).isoformat()
     state["last_trade_date"] = datetime.now(timezone.utc).strftime("%Y-%m-%d")
 
