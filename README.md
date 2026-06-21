@@ -50,10 +50,10 @@ System requirements: Python 3.11+, `twak` CLI, `bnbagent-sdk` installed. Linux/m
   Global metrics           | 3. Regime classification (LLM, hourly)                  |
   Quotes/latest (132 tok)  | 4. Freshness Ratio momentum scan                        |
                            | 5. Portfolio rebalancing + trailing stops               |
-  DeepSeek LLM -----------| 6. Execute swap plan (TWAK, 8s delay)                    |
+  DeepSeek LLM ---------- -| 6. Execute swap plan (TWAK, 8s delay)                   |
   (regime, hourly)         | 7. Log trades, update peak, save state                  |
-                           |                                                        |
-  TWAK CLI ---------------| SLEEP 900s -> REPEAT                                    |
+                           |                                                         |
+  TWAK CLI -------------- -| SLEEP 900s -> REPEAT                                    |
   (swap + portfolio)       ----------------------------------------------------------
 ```
 
@@ -139,7 +139,7 @@ A naive scanner buys Token A because +15% looks better. Freshness Ratio Alpha bu
 Every token passes through four sequential gates before scoring:
 
 ```
-132 tokens -> Gate 1 (Friction) -> Gate 2 (Freshness) -> Gate 3 (Liquidity) -> Gate 4 (Climax) -> SCORED
+132 tokens -> Gate 1 (Friction) -> Gate 2 (Freshness) -> Gate 3 (Liquidity) -> Gate 4 (Climax 24h) -> Gate 5 (Climax 1h) -> SCORED
 ```
 
 | Gate | Rule | Rationale |
@@ -147,7 +147,8 @@ Every token passes through four sequential gates before scoring:
 | 1. Friction Floor | `pct_1h >= 1.25%` | Must beat 0.25% DEX fee + slippage in one hour |
 | 2. Freshness | `freshness >= 0.20` (or auto-1.5 for slingshot) | Reject exhausted pumps where the move is stale |
 | 3. Liquidity | `volume_24h >= $100,000` | Avoid shallow pools where one swap moves the price |
-| 4. Climax Exhaustion | `pct_24h <= 40%` | Reject blow-off tops -- do not buy into distribution |
+| 4. Climax Exhaustion (24h) | `pct_24h <= 40%` | Reject blow-off tops -- do not buy into distribution |
+| 5. Hourly Climax | `pct_1h <= 30%` | Reject intra-hour blow-offs (+30% in 60 min = manipulation) |
 
 ### Acceleration Score (Cross-Sectional Ranking)
 
@@ -205,7 +206,7 @@ Position sizing:     2 tokens
 Allocation per:      50% of deployed capital each
 risk_on deployed:    80% of portfolio
 neutral deployed:    60% of portfolio
-risk_off deployed:   20% of portfolio
+risk_off deployed:   15% of portfolio
 ```
 
 Concentration is intentional for a 7-day sprint. 10 positions at 5% each means even a 100% winner adds only 5% to the portfolio. 2 positions at 40% each means a 25% winner adds 10%.
@@ -241,7 +242,7 @@ Output: structured JSON decision:
 |--------|-----------|-----------------|----------|
 | risk_on | 2 | 80% | Full concentrated bets on top momentum |
 | neutral | 2 | 60% | Moderate deployment, cautious sizing |
-| risk_off | 1 | 20% | Minimum exposure, mostly USDT |
+| risk_off | 1 | 15% | Minimum exposure, mostly USDT |
 
 On LLM failure (API down, timeout, bad JSON): defaults to `neutral` -- never crashes, never stops trading.
 
@@ -396,19 +397,19 @@ A fully autonomous, self-custody trading agent that reads markets via CMC free-t
 ```
 INPUT                      PROCESSING                          OUTPUT
 +--------------+           +--------------------------+        +------------------------+
-| regime       |           | 1. Fetch quotes for     |        | candidates[]           |
+| regime       |           | 1. Fetch quotes for      |        | candidates[]           |
 | (risk_on/    |           |    all non-stable        |        |   +- symbol            |
 |  neutral/    |---------->|    competition tokens    |------->|   +- acceleration      |
 |  risk_off)   |           |    via CMC /v2           |        |   +- freshness         |
 |              |           |                          |        |   +- pct_1h            |
-| top_n (int)  |           | 2. 4-gate pipeline      |        |   +- pct_24h           |
+| top_n (int)  |           | 2. 4-gate pipeline       |        |   +- pct_24h           |
 |              |           |    Friction->Freshness   |        |   +- vol_24h           |
 | cooldowns    |           |    ->Liquidity->Climax   |        |   +- market_cap        |
 | (optional)   |           |                          |        |   +- price             |
-+--------------+           | 3. Cross-sectional      |        |   +- reason            |
++--------------+           | 3. Cross-sectional       |        |   +- reason            |
                            |    ranking               |        +------------------------+
                            |                          |
-                           | 4. Top-N candidates     |
+                           | 4. Top-N candidates      |
                            +--------------------------+
 ```
 

@@ -72,13 +72,21 @@ volume_24h ≥ $100,000
 
 Avoids shallow pools where one swap moves the price against you. Every token passing this gate has meaningful market depth.
 
-### Gate 4: Climax Exhaustion
+### Gate 4: Climax Exhaustion (24h)
 
 ```
 pct_24h ≤ 40.0%
 ```
 
-Rejects blow-off tops. A token already up >40% in 24h is a climax distribution event, not an entry.
+Rejects 24h blow-off tops. A token already up >40% in 24h is a climax distribution event, not an entry.
+
+### Gate 5: Hourly Climax
+
+```
+pct_1h ≤ 30.0%
+```
+
+Rejects intra-hour blow-offs. A token pumping +30% or more in a single hour is manipulation -- do not buy into the candle. SIREN at +91.3% 1h is the canonical example: massive hourly pump, high risk of instant reversal.
 
 ---
 
@@ -183,7 +191,7 @@ The LLM (DeepSeek Chat, OpenAI-compatible) outputs a structured JSON decision:
 |--------|-----------|-----------------|----------|
 | risk_on | 2 | 80% | Full concentrated bets |
 | neutral | 2 | 60% | Moderate deployment |
-| risk_off | 1 | 20% | Minimum exposure, mostly cash |
+| risk_off | 1 | 15% | Minimum exposure, mostly cash |
 
 On LLM failure (API down, timeout, bad JSON): defaults to neutral — never crashes.
 
@@ -202,7 +210,7 @@ Sector coverage across the full 149-token list: Meme, AI, DeFi, Gaming, Layer 1,
 ## Data Flow (15-Minute Tick)
 
 ```
-┌─────────────────────────────────────────────────────────────┐
+┌──────────────────────────────────────────────────────────────┐
 │ TICK START                                                   │
 │   │                                                          │
 │   ├─ 1. Load state (portfolio_state.json)                    │
@@ -225,7 +233,7 @@ Sector coverage across the full 149-token list: Meme, AI, DeFi, Gaming, Layer 1,
 │   │     ├─ Buy top-2 targets at equal weight                 │
 │   │     └─ Truncate to remaining daily quota                 │
 │   │                                                          │
-│   └─ 7. Execute (TWAK swap CLI, 8s delay between swaps)     │
+│   └─ 7. Execute (TWAK swap CLI, 8s delay between swaps)      │
 │        ├─ Record trades to trade_log.json                    │
 │        ├─ Update peak portfolio value                        │
 │        └─ Save state                                         │
