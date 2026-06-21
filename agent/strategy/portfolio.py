@@ -26,6 +26,13 @@ MAX_TRADES_PER_DAY = 5
 SLIPPAGE_MULTIPLIER = 0.985   # 1.5% haircut: 0.25% DEX fee + slippage buffer
 BNB_GAS_BUFFER_USD = 20.0     # minimum BNB to leave for gas (never sell below this)
 
+# ── Exit guardrails ──
+STOP_LOSS_PCT = -0.05         # -5% from cost basis → force-sell 100% of position
+TAKE_PROFIT_PCT = 0.08        # +8% from cost basis → sell 50% to lock in gains
+# Round-trip friction is ~3% (1.5% entry + 1.5% exit).
+# Stop at -5% limits worst-case to -8% net loss.
+# Take-profit at +8% locks in ~5% net gain after friction.
+
 
 # ── Data models ──
 
@@ -101,9 +108,73 @@ def generate_swap_plan(
     deployable = total_value_usd * allocation_pct
     per_position = deployable / max(len(target_set), 1)
 
-    # ── SELL candidates: holdings NOT in target set ──
+    # ════════════════════════════════════════════════════════════════
+    # EXIT PRE-SCAN: stop-loss and take-profit (run BEFORE regular sells).
+    # These get priority — a stop-loss on a bleeding position matters more
+    # than rebalancing into a new target.
+    # ════════════════════════════════════════════════════════════════
+    exit_swaps: list[SwapInstruction] = []
+
+    for sym, info in volatile_holdings.items():
+        cost_basis = info.get("cost_basis_usd", 0)
+        balance = info.get("balance", 0.0)
+        if cost_basis <= 0 or balance <= 0:
+            continue
+
+        current_price = price_cache.get(sym, 0)
+        if current_price <= 0:
+            continue
+
+        # Unrealized PnL from cost basis
+        pnl_pct = (current_price - cost_basis) / cost_basis
+
+        if pnl_pct <= STOP_LOSS_PCT:
+            # Full exit — cut the loss at -5%
+            exit_swaps.append(SwapInstruction(
+                action="sell",
+                from_token=sym,
+                to_token="USDT",
+                amount_usd=cost_basis,
+                amount_token=balance,
+                reason=f"STOP_LOSS: {pnl_pct:+.1%} from cost basis (limit={STOP_LOSS_PCT:+.0%})",
+            ))
+            log.warning("Stop-loss triggered: %s at %+.1f%% (cost=$%.2f, now=$%.2f)",
+                       sym, pnl_pct * 100, cost_basis, current_price)
+
+        elif pnl_pct >= TAKE_PROFIT_PCT:
+            # Half exit — lock in gains, let remainder ride
+            half_balance = balance * 0.5
+            half_cost = cost_basis * 0.5
+            exit_swaps.append(SwapInstruction(
+                action="sell",
+                from_token=sym,
+                to_token="USDT",
+                amount_usd=half_cost,
+                amount_token=half_balance,
+                reason=f"TAKE_PROFIT: {pnl_pct:+.1%} from cost basis (target={TAKE_PROFIT_PCT:+.0%}, selling 50%)",
+            ))
+            log.info("Take-profit triggered: %s at %+.1f%% — selling half",
+                    sym, pnl_pct * 100)
+
+    # Exit swaps consume quota
+    sq = exit_swaps[:remaining]
+    exit_quota_used = len(sq)
+
+    # Track tokens fully closed by exit logic (so regular sells don't duplicate)
+    # Stop-loss: entire position is sold → skip regular sell entirely.
+    # Take-profit: half is sold → skip regular sell for remainder (let it ride).
+    exited_tokens: set[str] = set()
+    for s in sq:
+        exited_tokens.add(s.from_token)
+
+    # ════════════════════════════════════════════════════════════════
+    # REGULAR SELL candidates: holdings NOT in target set
+    # Skip tokens already closed by stop-loss.
+    # ════════════════════════════════════════════════════════════════
     sell_candidates: list[SwapInstruction] = []
     for sym, info in volatile_holdings.items():
+        if sym in exited_tokens:
+            continue  # Already handled by stop-loss or take-profit
         if sym not in target_set:
             cost_usd = info.get("cost_basis_usd", 0)
             balance = info.get("balance", 0.0)
@@ -138,17 +209,22 @@ def generate_swap_plan(
                         reason=f"BNB excess above ${BNB_GAS_BUFFER_USD} gas buffer",
                     ))
 
-    # Sells consume quota — sort by value descending, take top-N
+    # Quota already consumed by exit swaps (stop-loss/take-profit run first)
+    remaining_after_exits = remaining - exit_quota_used
+
+    # Regular sells consume remaining quota — sort by value descending, take top-N
     sell_candidates.sort(key=lambda s: s.amount_usd, reverse=True)
-    surviving_sells = sell_candidates[:remaining]
+    surviving_sells = sell_candidates[:remaining_after_exits]
 
     # Freed capital from sells, with slippage haircut
     raw_freed = sum(s.amount_usd for s in surviving_sells)
     freed_capital = raw_freed * SLIPPAGE_MULTIPLIER
-    remaining_after_sells = remaining - len(surviving_sells)
+    remaining_after_sells = remaining_after_exits - len(surviving_sells)
 
     # Available capital: stablecoins + slippage-adjusted sell proceeds
-    available_usd = stable_balance_usd + freed_capital
+    # Note: stop-loss/take-profit capital is also freed and added here
+    exit_freed = sum(s.amount_usd for s in sq)
+    available_usd = stable_balance_usd + freed_capital + (exit_freed * SLIPPAGE_MULTIPLIER)
 
     # ── BUY candidates: target tokens at equal weight ──
     buy_candidates: list[SwapInstruction] = []
@@ -184,8 +260,8 @@ def generate_swap_plan(
     # Buys consume quota — truncate to remaining_after_sells
     surviving_buys = buy_candidates[:remaining_after_sells]
 
-    # ── Build final plan: sells first, then buys ──
-    plan.swaps = surviving_sells + surviving_buys
+    # ── Build final plan: exits first, then regular sells, then buys ──
+    plan.swaps = sq + surviving_sells + surviving_buys
     plan.trades_used = len(plan.swaps)
     plan.remaining_quota = remaining - plan.trades_used
 
