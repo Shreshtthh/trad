@@ -43,7 +43,7 @@ from execution.guardrails import (
     MAX_TRADES_PER_DAY, DEFAULT_STATE_DIR,
 )
 from execution.twak_client import (
-    TwakClient, TradeResult,
+    TwakClient, TradeResult, Holdings,
 )
 from strategy.regime import classify_regime, RegimeDecision
 from strategy.momentum import discover_candidates
@@ -139,6 +139,96 @@ def _neutral_fallback(reason: str) -> str:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Paper Trade State Helpers
+# ═══════════════════════════════════════════════════════════════════════════
+
+def _build_holdings_from_state(state: dict) -> Holdings:
+    """Construct a Holdings object from state['holdings'] for paper trade mode.
+
+    Unlike the live twak_client.fetch_holdings() which queries the wallet,
+    this reconstructs the portfolio from the last saved state so paper trades
+    accumulate across ticks — buys add tokens, sells remove them.
+    """
+    h = Holdings()
+    raw = state.get("holdings", {})
+    if not raw:
+        # First ever tick: seed with simulated $10,000 USDT
+        raw = {"USDT": {"balance": 10_000.0, "cost_basis_usd": 10_000.0}}
+        state["holdings"] = raw
+
+    h.tokens = {k: dict(v) for k, v in raw.items()}
+    # Total value is estimated below with price cache; use cost_basis as fallback
+    h.total_value_usd = sum(v.get("cost_basis_usd", 0) for v in h.tokens.values())
+    return h
+
+
+def _apply_paper_holdings(state: dict, plan: SwapPlan) -> None:
+    """Update state['holdings'] to reflect executed paper swap plan.
+
+    Mutates state in place. Simulates balance changes for each swap:
+    - Sells: remove from_token balance, add to_token (USDT) balance
+    - Buys: reduce USDT balance, add to_token balance at execution price
+    """
+    holdings = state.setdefault("holdings", {})
+    if not holdings:
+        holdings["USDT"] = {"balance": 10_000.0, "cost_basis_usd": 10_000.0}
+
+    for si in plan.swaps:
+        if si.action == "sell":
+            # Remove the sold token entirely
+            from_tok = holdings.get(si.from_token, {})
+            if from_tok:
+                from_tok["balance"] = max(0, from_tok.get("balance", 0) - si.amount_token)
+                from_tok["cost_basis_usd"] = max(0, from_tok.get("cost_basis_usd", 0) - si.amount_usd)
+            # Clean up dust
+            if from_tok.get("balance", 0) < 0.0001:
+                holdings.pop(si.from_token, None)
+            # Add USDT proceeds (with slippage haircut)
+            usdt = holdings.setdefault(si.to_token, {"balance": 0, "cost_basis_usd": 0})
+            usdt["balance"] += si.amount_usd * 0.985  # 1.5% slippage
+            usdt["cost_basis_usd"] = usdt["balance"]  # USDT pegged
+            # Clear peak_price for sold token
+            holdings.pop(si.from_token + "_peak", None)
+
+        elif si.action == "buy":
+            # Reduce USDT balance
+            usdt = holdings.get(si.from_token, {})
+            if usdt:
+                usdt["balance"] = max(0, usdt.get("balance", 0) - si.amount_usd)
+                usdt["cost_basis_usd"] = usdt["balance"]
+            # Add bought token
+            to_tok = holdings.setdefault(si.to_token, {"balance": 0, "cost_basis_usd": 0})
+            to_tok["balance"] += si.amount_token
+            to_tok["cost_basis_usd"] = to_tok.get("cost_basis_usd", 0) + si.amount_usd
+            # Record peak price for trailing stop tracking
+            if si.amount_token > 0 and si.amount_usd > 0:
+                entry_price = si.amount_usd / si.amount_token
+                current_peak = to_tok.get("peak_price", 0)
+                if entry_price > current_peak:
+                    to_tok["peak_price"] = entry_price
+            # Clean up USDT dust
+            if usdt.get("balance", 0) < 0.01:
+                holdings.pop(si.from_token, None)
+
+
+def _paper_total_value(state: dict, price_cache: dict[str, float]) -> float:
+    """Estimate total portfolio value from paper holdings and current prices."""
+    holdings = state.get("holdings", {})
+    total = 0.0
+    for sym, info in holdings.items():
+        balance = info.get("balance", 0)
+        if balance <= 0:
+            continue
+        price = price_cache.get(sym.upper(), price_cache.get(sym, 0))
+        if price > 0:
+            total += balance * price
+        else:
+            # Fallback: use cost_basis for stablecoins or if no price available
+            total += info.get("cost_basis_usd", 0)
+    return total
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CMC Price Cache Helper
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -147,44 +237,65 @@ def _build_price_cache(
     candidates: list,
 ) -> dict[str, float]:
     """
-    Build a {symbol: usd_price} dict from holdings + CMC k-line data.
+    Build a {symbol: usd_price} dict from CMC quotes + cost-basis fallback.
 
-    Holdings provide accurate cost-basis prices for owned tokens.
-    CMC k-line provides current market prices for candidate tokens.
+    Always fetches fresh CMC prices for every held volatile token AND every
+    candidate. This is critical: the trailing stop-loss compares current price
+    against peak. If we used cost-basis as current price, the stop would
+    never trigger and the bot would ride a -90% dump to zero.
+
+    Cost-basis prices are used ONLY as a fallback when CMC does not return
+    a price for a token (e.g., small-cap, delisted, or API gap).
 
     Returns a dict keyed by uppercase symbol with float USD prices.
     """
     price: dict[str, float] = {}
 
-    # 1. Prices from holdings (cost_basis_usd / balance)
+    # 1. Collect all symbols needing fresh CMC prices
+    symbols_to_fetch: set[str] = set()
+    cost_basis_fallbacks: dict[str, float] = {}
+
+    # Held tokens — always fetch CMC prices for volatile ones
     for sym, info in holdings.tokens.items():
         sym_up = sym.upper()
         bal = info.get("balance", 0)
         cost = info.get("cost_basis_usd", 0)
         if bal > 0 and cost > 0:
-            price[sym_up] = cost / bal
+            cost_basis_fallbacks[sym_up] = cost / bal
+            # Fetch fresh prices for everything except pegged stablecoins
+            if sym_up not in ("USDT", "FDUSD", "USDC", "DAI", "TUSD", "FRAX", "USDD"):
+                symbols_to_fetch.add(sym_up)
 
-    # 2. CMC k-line prices for candidate tokens not already priced
-    unpriced = [c.symbol for c in candidates if c.symbol.upper() not in price]
-    # Also add USDT and BNB for reference
-    for ref in ["USDT", "BNB"]:
-        if ref not in price and ref not in [u.upper() for u in unpriced]:
-            unpriced.append(ref)
+    # Candidate tokens not already in the fetch list
+    for c in candidates:
+        sym_up = c.symbol.upper()
+        if sym_up not in symbols_to_fetch and sym_up not in ("USDT", "FDUSD"):
+            symbols_to_fetch.add(sym_up)
 
-    if unpriced:
+    # 2. Fetch fresh CMC prices for all needed symbols
+    if symbols_to_fetch:
         try:
-            klines = cmc_fetch_quotes_prices(unpriced, interval="15m", count=1)
-            for sym, p in klines.items():
+            fresh = cmc_fetch_quotes_prices(list(symbols_to_fetch))
+            for sym, p in fresh.items():
                 if p > 0:
                     price[sym.upper()] = p
         except Exception as exc:
-            log.warning("CMC k-line price fetch failed: %s", exc)
+            log.warning("CMC price fetch failed: %s — %d symbols unpriced", exc, len(symbols_to_fetch))
 
-    # 3. Fallbacks for essentials
-    price.setdefault("USDT", 1.0)
-    price.setdefault("FDUSD", 1.0)
+    # 3. Fall back to cost-basis ONLY for tokens CMC did not return
+    for sym, fallback_p in cost_basis_fallbacks.items():
+        if sym not in price:
+            price[sym] = fallback_p
+            log.debug("Price for %s: using cost-basis fallback ($%.4f)", sym, fallback_p)
 
-    log.debug("Price cache: %d tokens priced", len(price))
+    # 4. Stablecoin pegs (always $1.00)
+    for stable in ("USDT", "FDUSD", "USDC", "DAI", "TUSD", "FRAX", "USDD"):
+        price.setdefault(stable, 1.0)
+
+    log.debug("Price cache: %d tokens (CMC=%d, fallback=%d)",
+              len(price),
+              sum(1 for k in price if k not in cost_basis_fallbacks or k in price),
+              sum(1 for k in price if k in cost_basis_fallbacks and price.get(k) == cost_basis_fallbacks.get(k)))
     return price
 
 
@@ -276,20 +387,35 @@ class Orchestrator:
 
         # Step 2 — Run guardrails (daily reset, drawdown, inactivity, quota)
         verdict = run_checks(state)
-        log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
 
         # Step 3 — SKIP_REBALANCE: nothing to do
         if verdict.verdict == Verdict.SKIP_REBALANCE:
-            save_state(state)
-            return
+            if self._paper_trade:
+                log.info(
+                    "Guardrails: skip_rebalance — quota %d/%d (paper: continuing anyway)",
+                    state.get("trades_today", 0), MAX_TRADES_PER_DAY,
+                )
+            else:
+                log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
+                save_state(state)
+                return
+        else:
+            log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
 
-        # Step 4 — Fetch holdings
-        try:
-            holdings = self._twak.fetch_holdings()
-        except Exception as exc:
-            log.error("Holdings fetch failed: %s — skipping tick", exc)
-            save_state(state)
-            return
+        # Step 4 — Fetch holdings (or reconstruct from state in paper mode)
+        if self._paper_trade:
+            holdings = _build_holdings_from_state(state)
+            log.info(
+                "Paper holdings: %d tokens, $%.0f total",
+                len(holdings.tokens), holdings.total_value_usd,
+            )
+        else:
+            try:
+                holdings = self._twak.fetch_holdings()
+            except Exception as exc:
+                log.error("Holdings fetch failed: %s — skipping tick", exc)
+                save_state(state)
+                return
 
         total_value = holdings.total_value_usd
         if total_value <= 0:
@@ -376,6 +502,9 @@ class Orchestrator:
         # 7d — Generate swap plan (concentrated: 2 targets, allocation from regime)
         max_pos = self._regime.max_positions if self._regime else 2
         alloc_pct = self._regime.allocation_pct if self._regime else 0.80
+        # In paper trade mode, always tell the portfolio layer zero trades used
+        # so it never hits its internal quota cap — we want to see every tick.
+        effective_trades = 0 if self._paper_trade else state.get("trades_today", 0)
         plan: SwapPlan = generate_swap_plan(
             holdings=holdings.tokens,
             candidates=momentum.candidates,
@@ -384,7 +513,7 @@ class Orchestrator:
             max_positions=max_pos,
             allocation_pct=alloc_pct,
             total_value_usd=total_value,
-            trades_today=state.get("trades_today", 0),
+            trades_today=effective_trades,
         )
 
         # Merge penalty box cooldowns into state
@@ -397,8 +526,14 @@ class Orchestrator:
 
     # ── Plan execution ──────────────────────────────────────────────────
 
-    def _execute_and_record(self, state: dict, plan: SwapPlan, regime: str):
-        """Execute a swap plan via TWAK and record results to state + trade log."""
+    def _execute_and_record(self, state: dict, plan: SwapPlan, regime: str,
+                             *, quota_exempt: bool = False):
+        """Execute a swap plan via TWAK and record results to state + trade log.
+
+        quota_exempt=True: trades do NOT count toward the 5/day limit.
+        Used for circuit breaker exits — risk management must never be
+        throttled by the overtrading guard.
+        """
         if not plan.swaps:
             log.info("Swap plan empty — nothing to execute")
             state["regime"] = regime
@@ -412,7 +547,7 @@ class Orchestrator:
         for i, result in enumerate(results):
             if not result.success:
                 continue
-            state = record_trade(state, result)
+            state = record_trade(state, result, quota_exempt=quota_exempt)
             swap_reason = ""
             if i < len(plan.swaps):
                 swap_reason = plan.swaps[i].reason
@@ -428,12 +563,34 @@ class Orchestrator:
             })
 
         # Update holdings in state
-        try:
-            latest = self._twak.fetch_holdings()
-            state["holdings"] = latest.tokens
-            update_peak(state, latest.total_value_usd)
-        except Exception:
-            pass
+        if self._paper_trade:
+            # Simulate balance changes from paper swaps (don't call fetch_holdings
+            # because the paper stub is stateless and always returns $10K USDT).
+            _apply_paper_holdings(state, plan)
+            total_value = _paper_total_value(state, self._price_cache)
+            update_peak(state, total_value)
+        else:
+            try:
+                latest = self._twak.fetch_holdings()
+                # Merge instead of overwrite: TWAK returns {balance, value_usd,
+                # cost_basis_usd} but does NOT include peak_price. If we naively
+                # assign state["holdings"] = latest.tokens, the trailing stop
+                # reference is destroyed every tick. Preserve peak_price from the
+                # prior state so trailing stops can track the actual peak.
+                old_holdings = state.get("holdings", {})
+                merged = {}
+                for sym, info in latest.tokens.items():
+                    merged[sym] = dict(info)
+                    old_info = old_holdings.get(sym, {})
+                    stored_peak = old_info.get("peak_price", 0)
+                    # Carry forward the highest peak we have seen
+                    if stored_peak:
+                        current_peak = latest.tokens[sym].get("peak_price", 0) or 0
+                        merged[sym]["peak_price"] = max(stored_peak, current_peak)
+                state["holdings"] = merged
+                update_peak(state, latest.total_value_usd)
+            except Exception:
+                pass
 
         # Save final state
         state["regime"] = regime
@@ -538,7 +695,7 @@ class Orchestrator:
             "Circuit breaker: %d trailing stops triggered — executing exits",
             len(exit_plan.swaps),
         )
-        self._execute_and_record(state, exit_plan, "risk_off")
+        self._execute_and_record(state, exit_plan, "risk_off", quota_exempt=True)
 
     def _handle_compliance(self, state: dict):
         """Execute a $5 USDT → FDUSD compliance trade to stay active."""
