@@ -211,9 +211,11 @@ def cmc_fetch_quotes_data(
                 q = item.get("quote", {}).get("USD", {})
                 result[sym.upper()] = {
                     "price": float(q.get("price", 0) or 0),
+                    "percent_change_1h": float(q.get("percent_change_1h", 0) or 0),
                     "percent_change_24h": float(q.get("percent_change_24h", 0) or 0),
                     "volume_24h": float(q.get("volume_24h", 0) or 0),
                     "volume_change_24h": float(q.get("volume_change_24h", 0) or 0),
+                    "market_cap": float(q.get("market_cap", 0) or 0),
                 }
         except Exception:
             log.exception("cmc_fetch_quotes_data: batch failed (offset=%d)", i)

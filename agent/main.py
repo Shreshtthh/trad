@@ -11,7 +11,7 @@ Usage:
 Flow per tick:
     1. Load portfolio state from disk
     2. Run guardrails (drawdown → inactivity → quota)
-    3. Handle non-PROCEED verdicts (EMERGENCY_SELL, COMPLIANCE_TRADE, SKIP)
+    3. Handle non-PROCEED verdicts (CIRCUIT_BREAKER, COMPLIANCE_TRADE, SKIP)
     4. If PROCEED: fetch holdings → regime → momentum → portfolio → execute
     5. Record trades, update state, save to disk
     6. Sleep until next tick
@@ -278,26 +278,12 @@ class Orchestrator:
         verdict = run_checks(state)
         log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
 
-        # Step 3 — Handle non-PROCEED verdicts
-        if verdict.verdict == Verdict.EMERGENCY_SELL:
-            self._handle_emergency(state, verdict)
-            save_state(state)
-            return
-
+        # Step 3 — SKIP_REBALANCE: nothing to do
         if verdict.verdict == Verdict.SKIP_REBALANCE:
-            # Just save state (date reset may have mutated it) and sleep
             save_state(state)
             return
 
-        if verdict.verdict == Verdict.COMPLIANCE_TRADE:
-            self._handle_compliance(state)
-            save_state(state)
-            return
-
-        # Step 4 — PROCEED: full pipeline
-        assert verdict.verdict == Verdict.PROCEED
-
-        # 4a — Fetch holdings + build price cache
+        # Step 4 — Fetch holdings
         try:
             holdings = self._twak.fetch_holdings()
         except Exception as exc:
@@ -319,7 +305,18 @@ class Orchestrator:
             total_value, state["peak_value_usd"], state["drawdown_pct"],
         )
 
-        # 4b — Regime classification (once per hour)
+        # Step 5 — Handle heartbeat trade
+        if verdict.verdict == Verdict.COMPLIANCE_TRADE:
+            self._handle_compliance(state)
+
+        # Step 6 — Circuit breaker: skip momentum + buys, run exits only
+        if verdict.verdict == Verdict.CIRCUIT_BREAKER:
+            self._tick_exits_only(state, holdings, total_value)
+            return
+
+        # Step 7 — PROCEED: full pipeline
+
+        # 7a — Regime classification (once per hour)
         if self._regime is None or (time.monotonic() - self._last_regime_ts) >= REGIME_REFRESH_INTERVAL:
             log.info("Running regime classification...")
             try:
@@ -341,14 +338,17 @@ class Orchestrator:
 
         regime = self._regime.regime if self._regime else "neutral"
 
-        # 4c — Momentum discovery
+        # 7b — Momentum discovery
         log.info("Running momentum discovery (regime=%s)...", regime)
         try:
+            # Pass cooldowns from state for penalty box
+            cooldowns = state.get("cooldowns", {})
             momentum = discover_candidates(
                 mcp_execute=self._mcp,
                 regime=regime,
-                top_n=5,
+                top_n=2,  # concentrated: 2 positions
                 cmc_fetch=cmc_fetch_quotes_momentum,
+                cooldowns=cooldowns,
             )
         except Exception as exc:
             log.error("Momentum discovery crashed: %s — skipping tick", exc)
@@ -365,7 +365,7 @@ class Orchestrator:
         for i, c in enumerate(momentum.candidates):
             log.info("  Candidate #%d: %s score=%.3f (%s)", i+1, c.symbol, c.composite_score, c.reason)
 
-        # 4d — Build price cache (reuse holdings from step 4a, no extra TWAK call)
+        # 7c — Build price cache
         now = time.monotonic()
         if not self._price_cache or (now - self._last_price_ts) >= PRICE_REFRESH_SECONDS:
             self._price_cache = _build_price_cache(
@@ -373,40 +373,50 @@ class Orchestrator:
             )
             self._last_price_ts = now
 
-        # 4e — Generate swap plan
+        # 7d — Generate swap plan (concentrated: 2 targets, allocation from regime)
+        max_pos = self._regime.max_positions if self._regime else 2
+        alloc_pct = self._regime.allocation_pct if self._regime else 0.80
         plan: SwapPlan = generate_swap_plan(
             holdings=holdings.tokens,
             candidates=momentum.candidates,
             price_cache=self._price_cache,
             regime=regime,
-            max_positions=self._regime.max_positions if self._regime else 3,
-            allocation_pct=self._regime.allocation_pct if self._regime else 0.30,
+            max_positions=max_pos,
+            allocation_pct=alloc_pct,
             total_value_usd=total_value,
             trades_today=state.get("trades_today", 0),
         )
 
-        log.info("Swap plan: %d swaps, %d quota remaining, $%.0f idle",
-                 plan.trades_used, plan.remaining_quota, plan.idle_capital_usd)
-        if plan.note:
-            log.info("  Note: %s", plan.note)
+        # Merge penalty box cooldowns into state
+        if plan.new_cooldowns:
+            if "cooldowns" not in state:
+                state["cooldowns"] = {}
+            state["cooldowns"].update(plan.new_cooldowns)
 
+        self._execute_and_record(state, plan, regime)
+
+    # ── Plan execution ──────────────────────────────────────────────────
+
+    def _execute_and_record(self, state: dict, plan: SwapPlan, regime: str):
+        """Execute a swap plan via TWAK and record results to state + trade log."""
         if not plan.swaps:
-            log.info("No swaps needed — HOLD")
+            log.info("Swap plan empty — nothing to execute")
+            state["regime"] = regime
             save_state(state)
             return
 
-        # 4f — Execute plan
-        log.info("Executing %d swaps...", len(plan.swaps))
         results = self._twak.execute_plan(plan)
         successes = [r for r in results if r.success]
         failures = [r for r in results if not r.success]
 
-        # 4g — Record trades (successful only — failures don't consume quota)
-        for result in results:
+        for i, result in enumerate(results):
             if not result.success:
                 continue
             state = record_trade(state, result)
-            entry = {
+            swap_reason = ""
+            if i < len(plan.swaps):
+                swap_reason = plan.swaps[i].reason
+            log_trade({
                 "ts": datetime.now(timezone.utc).isoformat(),
                 "action": "swap",
                 "token": result.to_token,
@@ -414,17 +424,15 @@ class Orchestrator:
                 "amount": result.amount_token,
                 "tx_hash": result.tx_hash,
                 "regime": regime,
-                "reason": "momentum rebalance",
-            }
-            log_trade(entry)
+                "reason": swap_reason or "rebalance",
+            })
 
-        # Update holdings in state for emergency-sell awareness
+        # Update holdings in state
         try:
             latest = self._twak.fetch_holdings()
             state["holdings"] = latest.tokens
             update_peak(state, latest.total_value_usd)
         except Exception:
-            # Non-fatal: holdings snapshot is best-effort for state tracking
             pass
 
         # Save final state
@@ -439,48 +447,98 @@ class Orchestrator:
             for f in failures:
                 log.warning("  Failed: %s→%s error=%s", f.from_token, f.to_token, f.error)
 
-    # ── Verdict handlers ─────────────────────────────────────────────────
+    def _tick_exits_only(self, state: dict, holdings, total_value: float):
+        """
+        Circuit breaker tick: trailing stop exits ONLY.
 
-    def _handle_emergency(self, state: dict, verdict: GuardResult):
-        """Execute emergency sell plan: dump all volatile → USDT."""
-        log.critical(
-            "🚨 EMERGENCY SELL: %s — executing %d swaps",
-            verdict.reason, len(verdict.emergency_swaps),
+        No new buys. No regular sells (don't sell into a drawdown).
+        Only trailing stop-loss exits to protect remaining capital.
+        """
+        from strategy.portfolio import (
+            TRAILING_STOP_PCT, COOLDOWN_SECONDS, SwapInstruction, SwapPlan,
         )
-        if not verdict.emergency_swaps:
-            log.warning("Emergency triggered but no volatile tokens to sell")
+
+        log.warning(
+            "Circuit breaker active — trailing stop scan only "
+            "(no buys, no rebalancing sells)"
+        )
+
+        # Build price cache for current holdings
+        all_symbols = list(holdings.tokens.keys())
+        if not all_symbols:
+            log.info("No holdings to check trailing stops against")
             save_state(state)
             return
 
-        for i, swap in enumerate(verdict.emergency_swaps):
-            log.info(
-                "  Emergency swap %d/%d: %s → USDT (%.0f tokens)",
-                i + 1, len(verdict.emergency_swaps),
-                swap["from_token"], swap["amount_token"],
-            )
-            try:
-                # Emergency swaps bypass normal plan execution — direct TWAK
-                result = self._twak.execute_swap(swap)
-                if result.success:
-                    log.info("    ✅ tx=%s", result.tx_hash)
-                    state = record_trade(state, result)
-                    log_trade({
-                        "ts": datetime.now(timezone.utc).isoformat(),
-                        "action": "emergency_sell",
-                        "token": swap["to_token"],
-                        "from_token": swap["from_token"],
-                        "amount": swap["amount_token"],
-                        "amount_usd": swap["amount_usd"],
-                        "tx_hash": result.tx_hash,
-                        "regime": "risk_off",
-                        "reason": swap["reason"],
-                    })
-                else:
-                    log.error("    ❌ FAILED: %s", result.error)
-            except Exception as exc:
-                log.error("    ❌ EXCEPTION: %s", exc)
+        price_cache = _build_price_cache(holdings, [])
 
-        log.critical("🚨 Emergency exit complete — agent PAUSED until manual reset")
+        # Scan each holding for trailing stop violation
+        exit_plan = SwapPlan(
+            remaining_quota=MAX_TRADES_PER_DAY - state.get("trades_today", 0),
+        )
+        now = time.time()
+
+        for sym, info in holdings.tokens.items():
+            balance = info.get("balance", 0.0)
+            if balance <= 0:
+                continue
+
+            current_price = price_cache.get(sym.upper(), price_cache.get(sym, 0))
+            if current_price <= 0:
+                continue
+
+            stored_peak = info.get("peak_price", 0)
+            cost_basis = info.get("cost_basis_usd", current_price)
+            if stored_peak > 0:
+                peak = stored_peak
+            elif cost_basis > 0:
+                peak = cost_basis
+            else:
+                peak = current_price
+
+            # Update peak in state if price went higher
+            if current_price > peak:
+                if "holdings" not in state:
+                    state["holdings"] = {}
+                state["holdings"].setdefault(sym, {})
+                state["holdings"][sym]["peak_price"] = current_price
+                continue
+
+            stop_price = peak * (1.0 - TRAILING_STOP_PCT)
+            if current_price <= stop_price:
+                amount_usd = balance * current_price
+                exit_plan.swaps.append(SwapInstruction(
+                    action="sell",
+                    from_token=sym,
+                    to_token="USDT",
+                    amount_usd=amount_usd,
+                    amount_token=balance,
+                    reason=(
+                        f"CIRCUIT_BREAKER_STOP: peak=${peak:.4f} "
+                        f"now=${current_price:.4f} "
+                        f"({((current_price / peak) - 1) * 100:+.1f}%)"
+                    ),
+                ))
+                # Enforce 2h penalty box
+                if "cooldowns" not in state:
+                    state["cooldowns"] = {}
+                state["cooldowns"][sym.upper()] = now + COOLDOWN_SECONDS
+                log.warning(
+                    "Circuit breaker: trailing stop on %s peak=$%.4f now=$%.4f "
+                    "→ EXIT",
+                    sym, peak, current_price,
+                )
+
+        if not exit_plan.swaps:
+            log.info("Circuit breaker: no trailing stops triggered — HOLD")
+            save_state(state)
+            return
+
+        log.warning(
+            "Circuit breaker: %d trailing stops triggered — executing exits",
+            len(exit_plan.swaps),
+        )
+        self._execute_and_record(state, exit_plan, "risk_off")
 
     def _handle_compliance(self, state: dict):
         """Execute a $5 USDT → FDUSD compliance trade to stay active."""
