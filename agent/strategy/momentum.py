@@ -1,19 +1,22 @@
 """
-Momentum scoring engine — MCP orchestrator and eligibility filter.
+Momentum scoring engine — Freshness Ratio Alpha (Free-Tier Optimized).
+
+Strategy: Cross-sectional ranking using 1h vs 24h momentum to find
+"Ignition" breakouts (fresh) and "Slingshot" reversals (V-bottom).
+Rejects exhausted pumps where most of the move already happened.
 
 Flow (called every 15 min by main.py):
-1. Broad scan via CMC MCP altcoin_breakout_scanner_spot (2000 tokens → top 20 breakouts)
-2. Allowlist gate — drop any token not in COMP_TOKENS
-3. Stablecoin gate — drop pegged stables (no momentum to catch)
-4. Sector/regime gate — in neutral/risk_off, deprioritize tokens in cold sectors
-5. Trend alignment gate — optional multi-timeframe check on top candidates
-6. Return filtered top 3–5 candidates to main.py
-
-The heavy math (EMA, MACD, RSI, volume ratio) is computed by the CMC MCP skill.
-This module is a filter + gate, not a calculator.
+1. MCP breakout scan (usually empty — trending requires Standard tier)
+2. Fallback: fetch quotes for ALL non-stable competition tokens via CMC
+3. Gate 1: Friction Floor — must have ≥1.25% 1h momentum to clear fees
+4. Gate 2: Freshness Multiplier — slingshot vs ignition vs exhausted
+5. Gate 3: Liquidity — minimum $100k 24h volume
+6. Gate 4: Climax Exhaustion — reject tokens already up >40% in 24h
+7. Cross-sectional ranking by acceleration score → top 2 candidates
 """
 
 import logging
+import math
 from dataclasses import dataclass, field
 from typing import Optional
 
@@ -21,11 +24,45 @@ from data.allowlist import COMP_TOKENS, is_eligible, is_stablecoin, get_cmc_sect
 
 log = logging.getLogger(__name__)
 
+# ── Competition-wide allowlist ──
+# Scan ALL non-stable BEP-20 tokens from the 149 competition list.
+# Previously used a curated 20-token high-beta subset, but real-time
+# market data showed actual movers (SKYAI +3.21%, IP +2.62%) were
+# outside that subset. Full-list scan = 2 CMC API calls (100 + 49 tokens),
+# well within Basic tier rate limits at 4 calls/sec.
+def _build_scan_list() -> set[str]:
+    """Build the set of tokens to scan from the competition allowlist."""
+    from data.allowlist import eligible_non_stable
+    tokens = eligible_non_stable()
+    # Remove tokens with known CMC symbol issues or delisted
+    # (empty for now, but this is the hook)
+    return set(tokens)
+
+
+SCAN_LIST: set[str] = _build_scan_list()
+
+# ── Gates ──
+FRICTION_FLOOR_PCT = 1.25       # Must beat round-trip fees (~0.55%) in 1h alone with margin
+MIN_VOLUME_24H = 100_000        # Minimum 24h volume to avoid shallow pools
+CLIMAX_EXHAUSTION_PCT = 40.0    # Reject if 24h gain >40% (blow-off top)
+FRESHNESS_MIN = 0.20            # Below 0.20 = exhausted pump, reject
+
 # ── Data model ──
 
 @dataclass
 class MomentumCandidate:
     symbol: str
+    acceleration_score: float = 0.0  # cross-sectional rank score
+    freshness: float = 0.0           # 1h/24h ratio (or 1.5 for slingshot)
+    pct_1h: float = 0.0
+    pct_24h: float = 0.0
+    vol_24h: float = 0.0
+    vol_chg_24h: float = 0.0
+    market_cap: float = 0.0
+    price: float = 0.0
+    sector: Optional[str] = None
+    reason: str = ""
+    # Backward compat fields
     composite_score: float = 0.0
     price_change_24h_pct: float = 0.0
     volume_change_24h_pct: float = 0.0
@@ -33,8 +70,6 @@ class MomentumCandidate:
     close_vs_ema50_pct: float = 0.0
     macd_expanding: bool = False
     narrative_score: int = 0
-    sector: Optional[str] = None
-    reason: str = ""
 
 
 @dataclass
@@ -54,155 +89,218 @@ def discover_candidates(
     mcp_execute,
     regime: str,
     hot_sectors: Optional[set[str]] = None,
-    top_n: int = 5,
-    cmc_fetch=None,  # callable(symbols: list[str], interval: str, count: int) → dict
+    top_n: int = 2,
+    cmc_fetch=None,
+    cooldowns: Optional[dict[str, float]] = None,
 ) -> MomentumResult:
     """
-    Run the full momentum discovery pipeline.
+    Cross-sectional momentum discovery using Freshness Ratio.
 
     Args:
-        mcp_execute: callable(skill_name, params) → dict — injected MCP client.
-        regime: "risk_on" | "neutral" | "risk_off" from regime.py.
-        hot_sectors: set of sector names currently leading (from compare_sector_strength).
-        top_n: max candidates to return.
-        cmc_fetch: optional fallback callable for kline data when MCP scan yields nothing.
+        mcp_execute: MCP client (unused — kept for compat)
+        regime: "risk_on" | "neutral" | "risk_off"
+        hot_sectors: unused (freshness ratio replaces sector gate)
+        top_n: max candidates (default 2 for concentrated bets)
+        cmc_fetch: callable(symbols, interval, count) → dict[str, dict]
+        cooldowns: {symbol: cooldown_until_ts} from penalty box
     """
-    # Step 1 — Broad scan
-    raw = _run_breakout_scan(mcp_execute)
-    if raw is None:
-        return MomentumResult(error="Breakout scan failed — platform error")
+    import time as _time
+    t0 = _time.monotonic()
+    if cooldowns is None:
+        cooldowns = {}
 
-    result = MomentumResult(raw_scanned=len(raw))
+    # Step 1 — Try MCP scan (almost always empty on Basic tier)
+    try:
+        raw = _run_breakout_scan(mcp_execute)
+    except Exception:
+        raw = None
 
-    # Step 2 — Allowlist gate
-    eligible = [c for c in raw if is_eligible(c.symbol)]
-    result.passed_allowlist = len(eligible)
+    if raw:
+        eligible = [c for c in raw if is_eligible(c.symbol)]
+        if eligible:
+            return _build_result(eligible, top_n, t0, len(raw), len(eligible))
 
-    # ── ZERO-CANDIDATE FALLBACK ──────────────────────────────────
-    # When the broad scan yields no eligible tokens (common — the 149 BSC
-    # list is a tiny subset of the 2000 tokens scanned), fall back to
-    # direct k-line momentum scoring on liquid allowlist tokens.
-    # This prevents the bot from sitting idle and only ever hitting the
-    # 20-hour compliance trade.
-    if not eligible and cmc_fetch is not None:
-        log.info("No MCP breakout matches — activating k-line fallback for liquid tokens")
-        fallback_result = _fallback_liquid_scan(cmc_fetch, regime, hot_sectors, top_n)
-        if fallback_result.candidates:
-            return fallback_result
-        # If fallback also empty, return the original empty result so
-        # main.py can decide to HOLD rather than panic-sell.
-        result.error = "No eligible candidates from MCP scan or k-line fallback"
-        return result
-    # ────────────────────────────────────────────────────────────
+    # Step 2 — Fallback: fetch quotes for high-beta tokens
+    if cmc_fetch is None:
+        return MomentumResult(error="No CMC fetch function provided")
 
-    if not eligible:
-        log.warning("No breakout candidates passed the allowlist gate")
-        return result
+    try:
+        quotes = cmc_fetch(list(SCAN_LIST), None, None)
+    except Exception as exc:
+        log.error("Quotes fetch failed: %s", exc)
+        return MomentumResult(error=f"Quotes fetch failed: {exc}")
 
-    # Step 3 — Stablecoin gate
-    non_stable = [c for c in eligible if not is_stablecoin(c.symbol)]
-    result.passed_stable_gate = len(non_stable)
-    if not non_stable:
-        log.warning("All eligible candidates were stablecoins — no tradeable momentum")
-        return result
+    if not quotes:
+        return MomentumResult(error="Quotes returned empty")
 
-    # Step 4 — Sector/regime gate
-    passed = _apply_regime_gate(non_stable, regime, hot_sectors)
-    result.passed_regime_gate = len(passed)
-    if not passed:
-        log.info("No candidates passed the regime gate (regime=%s)", regime)
-        return result
+    result = MomentumResult(raw_scanned=len(SCAN_LIST))
 
-    # Step 5 — Assign reasons, sort, truncate
-    for c in passed:
-        c.reason = _build_reason(c, regime)
+    # Step 3 — Score each token
+    scored: list[MomentumCandidate] = []
+    for sym in SCAN_LIST:
+        q = quotes.get(sym)
+        if not q:
+            continue
 
-    passed.sort(key=lambda c: c.composite_score, reverse=True)
-    result.candidates = passed[:top_n]
+        # Skip tokens in penalty box
+        cooldown_until = cooldowns.get(sym.upper(), 0)
+        if _time.time() < cooldown_until:
+            log.debug("Penalty box: %s cooldown until %s", sym,
+                      _time.strftime("%H:%M:%S", _time.localtime(cooldown_until)))
+            continue
+
+        cand = _score_token(sym, q, regime)
+        if cand is not None:
+            scored.append(cand)
+
+    result.passed_allowlist = len(scored)
+
+    # Step 4 — Cross-sectional ranking
+    scored.sort(key=lambda c: c.acceleration_score, reverse=True)
+    final = scored[:top_n]
+
+    for c in final:
+        result.passed_stable_gate += 1
+        result.passed_regime_gate += 1
+        c.reason = (
+            f"freshness={c.freshness:.2f} "
+            f"1h={c.pct_1h:+.1f}% "
+            f"24h={c.pct_24h:+.1f}% "
+            f"score={c.acceleration_score:.3f}"
+        )
+
+    result.candidates = final
+    result.scan_duration_s = _time.monotonic() - t0
 
     log.info(
-        "Momentum pipeline: %d raw → %d allowlist → %d non-stable → %d regime → %d final",
-        result.raw_scanned,
-        result.passed_allowlist,
-        result.passed_stable_gate,
-        result.passed_regime_gate,
-        len(result.candidates),
+        "Alpha scan: %d tokens → %d passed gates → %d final (%.1fs)",
+        len(SCAN_LIST), len(scored), len(final),
+        result.scan_duration_s,
     )
+    if not final:
+        result.error = "No tokens passed freshness gates"
     return result
 
 
-# ── Internal helpers ──
+# ── Token scoring ──
+
+def _score_token(
+    sym: str,
+    q: dict,
+    regime: str,
+) -> Optional[MomentumCandidate]:
+    """Score a single token. Returns None if it fails any gate."""
+
+    pct_1h = q.get("percent_change_1h", 0.0)
+    pct_24h = q.get("percent_change_24h", 0.0)
+    price = q.get("price", 0.0)
+    vol_24h = q.get("volume_24h", 0.0)
+    vol_chg_24h = q.get("volume_change_24h", 0.0)
+    mcap = q.get("market_cap", 1.0)
+
+    # ── Gate 1: Friction Floor ──
+    # Must be moving ≥2% per hour to beat round-trip fees.
+    if pct_1h < FRICTION_FLOOR_PCT:
+        return None
+
+    # ── Gate 2: Freshness Multiplier ──
+    if pct_24h < 0:
+        # Slingshot: down on the day, violently up this hour. Reversal.
+        freshness = 1.5
+    else:
+        # Ignition: what % of 24h move happened in the last hour?
+        freshness = pct_1h / max(pct_24h, pct_1h, 0.1)
+
+    if freshness < FRESHNESS_MIN:
+        log.debug("Alpha rejected %s: exhausted pump (freshness=%.2f)", sym, freshness)
+        return None
+
+    # ── Gate 3: Liquidity ──
+    if vol_24h < MIN_VOLUME_24H:
+        log.debug("Alpha rejected %s: low volume ($%.0f)", sym, vol_24h)
+        return None
+
+    # ── Gate 4: Climax Exhaustion ──
+    if pct_24h > CLIMAX_EXHAUSTION_PCT:
+        log.debug("Alpha rejected %s: climax exhaustion (+%.1f%%)", sym, pct_24h)
+        return None
+
+    # ── Acceleration Score ──
+    # Combines: 1h momentum × freshness × liquidity intensity
+    turnover_ratio = vol_24h / max(mcap, 1.0)
+    liquidity_intensity = math.log1p(turnover_ratio * 100)
+    acceleration = pct_1h * freshness * liquidity_intensity
+
+    # Volume confirmation modifier
+    if vol_chg_24h > 0:
+        acceleration *= 1.0 + min(vol_chg_24h / 100, 0.15)
+
+    cand = MomentumCandidate(
+        symbol=sym.upper(),
+        acceleration_score=acceleration,
+        freshness=freshness,
+        pct_1h=pct_1h,
+        pct_24h=pct_24h,
+        vol_24h=vol_24h,
+        vol_chg_24h=vol_chg_24h,
+        market_cap=mcap,
+        price=price,
+        sector=get_cmc_sector(sym),
+        # Backward compat
+        composite_score=acceleration,
+        price_change_24h_pct=pct_24h,
+        volume_change_24h_pct=vol_chg_24h,
+    )
+    return cand
+
+
+# ── MCP breakout scan (kept for compat, rarely fires) ──
 
 def _run_breakout_scan(mcp_execute) -> Optional[list[MomentumCandidate]]:
-    """
-    Call altcoin_breakout_scanner_spot via MCP.
-    Returns parsed MomentumCandidate list or None on failure.
-    """
+    """Try MCP breakout scan. Returns None on failure (expected on Basic tier)."""
     try:
         response = mcp_execute("altcoin_breakout_scanner_spot", {"preview": True})
-    except Exception as exc:
-        log.error("MCP breakout scan exception: %s", exc)
+    except Exception:
         return None
 
     if not response.get("ok"):
-        err = response.get("error", {}).get("message", "unknown MCP error")
-        log.error("MCP breakout scan failed: %s", err)
         return None
 
     data = response.get("data", {})
     report = data.get("decision_report", {})
     analysis_text = report.get("analysis", "")
+    if not analysis_text:
+        return None
 
-    # Parse candidates from the analysis text.
-    # The altcoin_breakout_scanner_spot returns ranked candidates in the
-    # "analysis" field as markdown with numbered entries.
-    candidates = _parse_breakout_analysis(analysis_text)
-    return candidates
+    return _parse_breakout_analysis(analysis_text)
 
 
 def _parse_breakout_analysis(text: str) -> list[MomentumCandidate]:
-    """
-    Parse the English analysis text from altcoin_breakout_scanner_spot.
-
-    Three regions:
-      A. Ranking preamble — "composite score (0.696)" / "leader SYMBOL (0.XXXX)"
-      B. Numbered detail entries — `1. **SYM …**` with RSI, EMA, price/vol
-      C. Backup watchlist — inline "SYM (Name, composite 0.XXXX)"
-    """
+    """Parse CMC MCP breakout analysis text. (Legacy, rarely used.)"""
     import re
 
     candidates: list[MomentumCandidate] = []
     seen: set[str] = set()
 
-    # ── Helper: extract composite scores from ranking preamble ───────
-    # Two patterns:
-    #   "SUP has … composite score (0.696)" → nearest preceding CAPS word
-    #   "leader BOBA (0.6112)"             → symbol directly before paren
     def _extract_preamble_scores(region: str) -> dict[str, float]:
         scores: dict[str, float] = {}
-        # Pattern A: "composite score (N.NNN)" → walk back for symbol
         for m in re.finditer(r'composite\s+score\s*\(([\d.]+)\)', region, re.IGNORECASE):
             val = float(m.group(1))
             if not (0.3 < val < 1.0):
                 continue
-            # Search backwards for the nearest all-caps word (symbol)
             before = region[:m.start()]
             sym_match = re.findall(r'\b([A-Z]{2,10})\b', before)
             if sym_match:
-                scores[sym_match[-1]] = val  # closest
-        # Pattern B: "SYMBOL (N.NNN)" adjacent
+                scores[sym_match[-1]] = val
         for m in re.finditer(r'\b([A-Z]{2,10})\s*\(([\d.]+)\)', region):
             sym, val = m.group(1), float(m.group(2))
             if 0.3 < val < 1.0 and sym not in scores:
                 scores[sym] = val
         return scores
 
-    preamble_scores: dict[str, float] = _extract_preamble_scores(text)
-
-    # ── Pass B: Numbered detail entries ──────────────────────────────
-    # Split on numbered entries, and truncate each at the next section
-    # header or backup list to prevent bleed-through.
+    preamble_scores = _extract_preamble_scores(text)
     raw_entries = re.split(r'\n(?=\d+\.\s+\*\*)', text)
+
     for entry in raw_entries:
         sym_match = re.match(r'\d+\.\s+\*\*(\S+)', entry)
         if not sym_match:
@@ -210,282 +308,52 @@ def _parse_breakout_analysis(text: str) -> list[MomentumCandidate]:
         symbol = sym_match.group(1).rstrip('*')
         seen.add(symbol)
 
-        # Truncate at the next section boundary to avoid bleed
         boundary = re.search(r'\n(?:#{1,3}\s|Backup Watchlist|\d+\.\s+\*\*)', entry)
         entry_clean = entry[:boundary.start()] if boundary else entry
 
         cand = MomentumCandidate(symbol=symbol)
-
-        # Composite: prefer embedded in THIS entry, fall back to preamble
         score_match = re.search(
             r'composite\s+(?:score(?:\s+of)?\s*:?\s*)?([\d.]+)',
-            entry_clean, re.IGNORECASE
-        )
+            entry_clean, re.IGNORECASE)
         if score_match:
             cand.composite_score = float(score_match.group(1).rstrip(').:'))
         elif symbol in preamble_scores:
             cand.composite_score = preamble_scores[symbol]
 
-        # 24h price change
         pm = re.search(r'([\d.-]+)%\s+24h?\s*(?:hour\s*)?price\s+(?:gain|loss|change|rise|drop|surge)', entry_clean)
         if pm:
             cand.price_change_24h_pct = float(pm.group(1))
-
-        # 24h volume change
         vm = re.search(r'([\d.-]+)%\s+24h?\s*(?:hour\s*)?volume\s+(?:increase|decrease|change|rise|surge)', entry_clean)
         if vm:
             cand.volume_change_24h_pct = float(vm.group(1))
-
-        # EMA50
-        em = re.search(r'(?:close|price)\s+~?([\d.-]+)%\s+(?:above|below)\s+(?:its\s+)?EMA', entry_clean)
-        if em:
-            cand.close_vs_ema50_pct = float(em.group(1))
-
-        # RSI
         rm = re.search(r'RSI\s+(?:of|at)\s+([\d.]+)', entry_clean)
         if rm:
             cand.rsi_4h = float(rm.group(1).rstrip('.'))
-
         cand.macd_expanding = 'expanding macd' in entry_clean.lower()
         nm = re.search(r'[Ss]ustainability\s+score\s+is\s+(\d+)', entry_clean)
         if nm:
             cand.narrative_score = int(nm.group(1))
-
-        cand.sector = get_cmc_sector(symbol)
-        candidates.append(cand)
-
-    # ── Pass C: Backup watchlist ─────────────────────────────────────
-    # Isolate the backup section to avoid false positives from preamble.
-    backup_start = text.find('### Backup')
-    if backup_start == -1:
-        backup_start = text.find('Backup Watchlist')
-    if backup_start == -1:
-        backup_start = text.find('backup')
-    backup_region = text[backup_start:] if backup_start != -1 else ''
-
-    # "RARE (SuperRare, composite 0.5962)" or "ACE (Fusionist, 0.5543)"
-    # Match: SYM (anything but closing paren, optionally "composite" then a float)
-    for m in re.finditer(
-        r'\b([A-Z][A-Z0-9]{1,10})\s*\(([^)]*?\b([\d.]+)\s*)\)',
-        backup_region,
-    ):
-        symbol = m.group(1)
-        if symbol in seen:
-            continue
-        # Avoid false matches on narrative text like "RSI (81.95)"
-        if symbol in ('RSI', 'MACD', 'EMA', 'The', 'From', 'This', 'All'):
-            continue
-        raw_val = m.group(3)
-        try:
-            val = float(raw_val)
-        except ValueError:
-            continue
-        # Backup candidates have composite scores in 0.4–0.7 range
-        if not (0.3 < val < 0.8):
-            continue
-        seen.add(symbol)
-
-        cand = MomentumCandidate(symbol=symbol, composite_score=val)
         cand.sector = get_cmc_sector(symbol)
         candidates.append(cand)
 
     return candidates
 
 
-# ── Top liquid tokens for zero-candidate fallback ──
-# These are the most-liquid non-stablecoin tokens from the 149 list
-# most likely to have reliable CMC Pro API k-line data.
-_FALLBACK_LIQUID: list[str] = [
-    "ETH", "BNB", "XRP", "DOGE", "ADA", "LINK", "BCH",
-    "LTC", "AVAX", "DOT", "UNI", "AAVE", "CAKE",
-    "TRX", "TON", "SHIB", "FLOKI", "BONK",
-    "FET", "INJ", "AXS", "SNX", "COMP",
-]
-
-
-def _fallback_liquid_scan(
-    cmc_fetch,  # callable(symbols, interval, count) → dict[str, dict] (quotes-based)
-    regime: str,
-    hot_sectors: Optional[set[str]],
-    top_n: int,
-) -> MomentumResult:
-    """
-    Fallback: fetch latest quotes for liquid allowlist tokens and score
-    by 24h momentum. Uses /v2/cryptocurrency/quotes/latest (Basic-tier compatible).
-
-    The old version used k-line/OHLCV which requires CMC Standard tier ($299/mo).
-    Quotes/latest gives us percent_change_24h directly — one API call instead of 23.
-    """
-    import time as _time
-    t0 = _time.monotonic()
-
-    result = MomentumResult(raw_scanned=len(_FALLBACK_LIQUID))
-
-    try:
-        quotes_data = cmc_fetch(_FALLBACK_LIQUID, None, None)  # interval/count ignored
-    except Exception as exc:
-        log.error("Fallback quotes fetch failed: %s", exc)
-        result.error = f"Fallback quotes fetch failed: {exc}"
-        return result
-
-    if not quotes_data:
-        log.warning("Fallback quotes returned empty — CMC quotes/latest may be unavailable")
-        result.error = "Fallback quotes returned empty"
-        return result
-
-    candidates: list[MomentumCandidate] = []
-    for sym in _FALLBACK_LIQUID:
-        q = quotes_data.get(sym)
-        if not q:
-            continue
-
-        pct_24h = q.get("percent_change_24h", 0)
-        price = q.get("price", 0)
-        vol_24h = q.get("volume_24h", 0)
-        vol_chg_24h = q.get("volume_change_24h", 0)
-
-        if price <= 0:
-            continue
-        if pct_24h <= 0:
-            continue  # Only positive momentum in fallback mode
-
-        # ── Volume confirmation ──
-        # Price up on falling volume = fakeout / low-liquidity chop.
-        # Require volume to be stable or expanding.
-        if vol_chg_24h < 0:
-            log.debug(
-                "Fallback dropped %s: +%.1f%% price but %.0f%% vol drop — unconfirmed",
-                sym, pct_24h, vol_chg_24h,
-            )
-            continue
-
-        # ── Entry cap ──
-        # Don't chase tokens already up >8% — mean reversion risk too high.
-        if pct_24h > 8:
-            log.debug(
-                "Fallback dropped %s: +%.1f%% exceeds 8%% entry cap",
-                sym, pct_24h,
-            )
-            continue
-
-        # ── Friction-aware minimum threshold ──
-        # Round-trip: entry (1.5% slippage) + exit (1.5% slippage) = ~3% floor.
-        # We need to clear friction with margin. Threshold scales by regime:
-        #   risk_on:  3% — market trending, lower bar
-        #   neutral:  3.5% — baseline, clears friction with slim margin
-        #   risk_off: 5% — only strong momentum worth the risk in a bear market
-        thresholds = {"risk_on": 3.0, "neutral": 3.5, "risk_off": 5.0}
-        threshold = thresholds.get(regime, 3.5)
-        if pct_24h < threshold:
-            log.debug(
-                "Fallback dropped %s: +%.1f%% below %.0f%% threshold (regime=%s)",
-                sym, pct_24h, threshold, regime,
-            )
-            continue
-
-        # Composite: base on 24h price gain, normalized to 0-1 scale.
-        # Volume-confirmed moves get a small boost.
-        composite = pct_24h / 100
-        vol_factor = min(vol_chg_24h / 100, 0.15)  # up to 15% bonus for strong volume
-        composite += max(0, vol_factor)
-        composite = min(composite, 1.0)
-
-        flags = []
-        if vol_chg_24h >= 20:
-            flags.append("vol_strong")
-        cand = MomentumCandidate(
-            symbol=sym,
-            composite_score=composite,
-            price_change_24h_pct=pct_24h,
-            volume_change_24h_pct=vol_chg_24h,
-            sector=get_cmc_sector(sym),
-            reason=f"fallback: 24h_momentum={pct_24h:+.1f}% vol={vol_chg_24h:+.0f}% {' '.join(flags)}".strip(),
-        )
-        candidates.append(cand)
-
-    result.passed_allowlist = len(candidates)
-    result.passed_stable_gate = len(candidates)  # _FALLBACK_LIQUID has no stables
-
-    # Apply regime gate
-    passed = _apply_regime_gate(candidates, regime, hot_sectors)
-    result.passed_regime_gate = len(passed)
-
-    for c in passed:
-        c.reason = f"{c.reason}, sector={c.sector or '?'}, regime={regime}"
-
-    passed.sort(key=lambda c: c.composite_score, reverse=True)
-    result.candidates = passed[:top_n]
-    result.scan_duration_s = _time.monotonic() - t0
-
-    log.info(
-        "Fallback scan: %d liquid tokens → %d positive momentum → %d final (%.1fs)",
-        len(_FALLBACK_LIQUID), len(candidates), len(result.candidates),
-        result.scan_duration_s,
-    )
-    return result
-
-
-def _apply_regime_gate(
+def _build_result(
     candidates: list[MomentumCandidate],
-    regime: str,
-    hot_sectors: Optional[set[str]],
-) -> list[MomentumCandidate]:
-    """
-    Apply sector/regime filtering.
-
-    risk_on:   accept all non-stablecoin eligible tokens.
-    neutral:   accept tokens with sector=None (unknown) OR sector in hot_sectors.
-    risk_off:  accept only tokens with sector in hot_sectors AND composite > threshold.
-    """
-    if hot_sectors is None:
-        hot_sectors = set()
-
-    if regime == "risk_on":
-        return candidates  # all pass
-
-    if regime == "neutral":
-        passed = []
-        for c in candidates:
-            if c.sector is None:
-                passed.append(c)  # unknown sector → pass through on momentum
-            elif c.sector in hot_sectors:
-                passed.append(c)  # confirmed hot sector
-            else:
-                log.debug("Regime gate dropped %s (sector=%s, not in hot_sectors=%s)",
-                          c.symbol, c.sector, hot_sectors)
-        return passed
-
-    if regime == "risk_off":
-        # Friction-aware: only tokens strong enough to clear round-trip costs.
-        # Round-trip = entry (1.5%) + exit (1.5%) = 3% floor.
-        # Require ≥3% gain to have any profit margin.
-        passed = []
-        has_hot = bool(hot_sectors)
-        for c in candidates:
-            if c.composite_score >= 0.03:  # ≥3% gain clears friction
-                if has_hot and c.sector is not None and c.sector not in hot_sectors:
-                    log.debug("Regime gate (risk_off) dropped %s (sector=%s, not hot)",
-                              c.symbol, c.sector)
-                    continue
-                passed.append(c)
-            else:
-                log.debug("Regime gate (risk_off) dropped %s (score=%.3f < 0.03)",
-                          c.symbol, c.composite_score)
-        return passed
-
-    return candidates
-
-
-def _build_reason(c: MomentumCandidate, regime: str) -> str:
-    """Build a human-readable reason string for trade logging."""
-    parts = [
-        f"composite={c.composite_score:.3f}",
-        f"Δ24h={c.price_change_24h_pct:.1f}%",
-        f"RSI={c.rsi_4h:.0f}",
-    ]
-    if c.sector:
-        parts.append(f"sector={c.sector}")
-    else:
-        parts.append("sector=unknown(pass-through)")
-    parts.append(f"regime={regime}")
-    return ", ".join(parts)
+    top_n: int,
+    t0: float,
+    raw_scanned: int,
+    passed_allowlist: int,
+) -> MomentumResult:
+    """Truncate and wrap candidates into a MomentumResult."""
+    candidates.sort(key=lambda c: c.composite_score or c.acceleration_score,
+                    reverse=True)
+    return MomentumResult(
+        candidates=candidates[:top_n],
+        raw_scanned=raw_scanned,
+        passed_allowlist=passed_allowlist,
+        passed_stable_gate=len(candidates[:top_n]),
+        passed_regime_gate=len(candidates[:top_n]),
+        scan_duration_s=__import__("time").monotonic() - t0,
+    )
