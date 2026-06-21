@@ -6,7 +6,7 @@ scan or portfolio rebalancing. All checks are rule-based — zero LLM on the
 hot path.
 
 Order of checks (fast-fail):
-  1. Drawdown monitor: if current_value < 0.75 × peak → EMERGENCY_SELL
+  1. Drawdown monitor: if current_value < 0.75 × peak → CIRCUIT_BREAKER
   2. Trade counter reset: if UTC date changed → trades_today = 0
   3. Inactivity fallback: if >20h since last_trade_ts → COMPLIANCE_TRADE
   4. Quota check: if trades_today >= 5 → SKIP_REBALANCE
@@ -28,7 +28,7 @@ log = logging.getLogger(__name__)
 
 # ── Constants ──
 MAX_DRAWDOWN_PCT = 0.25          # 25% from peak → emergency
-INACTIVITY_HOURS = 20             # force compliance trade after 20h idle
+INACTIVITY_HOURS = 18             # force heartbeat after 18h idle (hackathon rule)
 MAX_TRADES_PER_DAY = 5
 MIN_TRADE_USD = 5.0               # compliance trade size
 COMPLIANCE_FROM = "USDT"          # compliance swap from
@@ -44,20 +44,20 @@ class Verdict(Enum):
     PROCEED = "proceed"                    # all clear → momentum → portfolio → execute
     SKIP_REBALANCE = "skip_rebalance"      # quota exhausted or nothing to do
     COMPLIANCE_TRADE = "compliance_trade"   # >20h idle → force $5 USDT→FDUSD
-    EMERGENCY_SELL = "emergency_sell"      # ≥25% drawdown → sell all volatile, pause
+    CIRCUIT_BREAKER = "circuit_breaker"    # ≥25% drawdown → halt buys, allow exits + heartbeat
 
 
 @dataclass
 class GuardResult:
     verdict: Verdict
     reason: str = ""
-    # For EMERGENCY_SELL: list of SwapInstruction-like dicts to execute
+    # For CIRCUIT_BREAKER: list of SwapInstruction-like dicts to execute
     emergency_swaps: list[dict] = field(default_factory=list)
 
     @property
     def is_blocking(self) -> bool:
         """True if the orchestrator should not proceed to momentum/portfolio."""
-        return self.verdict in (Verdict.SKIP_REBALANCE, Verdict.EMERGENCY_SELL)
+        return self.verdict == Verdict.SKIP_REBALANCE
 
 
 # ── State I/O ────────────────────────────────────────────────────────────
@@ -143,26 +143,27 @@ def check_daily_reset(state: dict) -> dict:
 
 def check_drawdown(state: dict) -> GuardResult:
     """
-    Check if drawdown exceeds 25% from peak.
+    Circuit breaker: halt new entries at -25% from peak.
 
-    Compares current_value_usd against peak_value_usd. If the portfolio has
-    lost ≥25% from its all-time high, return EMERGENCY_SELL with a plan to
-    sell every volatile token to USDT.
+    Competition rules disqualify at -30%. We freeze at -25% to leave a buffer.
+    When triggered:
+    - No new BUY entries (momentum scan skipped)
+    - Trailing stops still fire (exits protect remaining capital)
+    - Heartbeat trades still execute (compliance: 1 trade/day)
+    - Does NOT force-sell everything — positions can recover
 
-    Emergency is LATCHING: once triggered, stays true even if portfolio
-    recovers. Only a manual reset (editing state file) clears it.
+    LATCHING: once triggered, stays true until manual reset.
     """
     if state.get("emergency_triggered"):
         return GuardResult(
-            verdict=Verdict.EMERGENCY_SELL,
-            reason="EMERGENCY already triggered — paused until manual reset",
+            verdict=Verdict.CIRCUIT_BREAKER,
+            reason="Circuit breaker triggered — no new entries. Trailing stops + heartbeat only.",
         )
 
     peak = state.get("peak_value_usd", 0)
     current = state.get("current_value_usd", 0)
 
     if peak <= 0:
-        # First run — set peak to current
         if current > 0:
             state["peak_value_usd"] = current
             state["drawdown_pct"] = 0.0
@@ -174,31 +175,13 @@ def check_drawdown(state: dict) -> GuardResult:
     if drawdown >= MAX_DRAWDOWN_PCT:
         state["emergency_triggered"] = True
         log.error(
-            "DRAWDOWN EMERGENCY: peak=$%.0f current=$%.0f drawdown=%.1f%% (limit=%.0f%%)",
+            "CIRCUIT BREAKER: peak=$%.0f current=$%.0f drawdown=%.1f%% (limit=%.0f%%). "
+            "Halting all buys. Trailing stops + heartbeat remain active.",
             peak, current, drawdown * 100, MAX_DRAWDOWN_PCT * 100,
         )
-
-        # Build emergency sell list: every volatile holding → USDT
-        emergency_swaps: list[dict] = []
-        from data.allowlist import is_stablecoin
-        for sym, info in state.get("holdings", {}).items():
-            if is_stablecoin(sym) or sym == "BNB":
-                continue  # keep stables + BNB (gas)
-            balance = info.get("balance", 0)
-            if balance > 0:
-                emergency_swaps.append({
-                    "action": "sell",
-                    "from_token": sym,
-                    "to_token": "USDT",
-                    "amount_token": balance,
-                    "amount_usd": info.get("cost_basis_usd", 0),
-                    "reason": f"EMERGENCY: {drawdown*100:.1f}% drawdown",
-                })
-
         return GuardResult(
-            verdict=Verdict.EMERGENCY_SELL,
-            reason=f"Emergency: {drawdown*100:.1f}% drawdown ≥ {MAX_DRAWDOWN_PCT*100:.0f}%",
-            emergency_swaps=emergency_swaps,
+            verdict=Verdict.CIRCUIT_BREAKER,
+            reason=f"Circuit breaker: {drawdown*100:.1f}% drawdown ≥ {MAX_DRAWDOWN_PCT*100:.0f}%. No buys, exits only.",
         )
 
     return GuardResult(verdict=Verdict.PROCEED, reason=f"Drawdown {drawdown*100:.1f}% OK")
@@ -316,7 +299,7 @@ def run_checks(state: dict) -> GuardResult:
 
     Priority:
       1. Daily trade counter reset (mutates state, not a verdict)
-      2. Drawdown check (EMERGENCY_SELL blocks everything)
+      2. Drawdown check (CIRCUIT_BREAKER blocks everything)
       3. Inactivity check (COMPLIANCE_TRADE skips normal flow)
       4. Quota check (SKIP_REBALANCE if no trades left)
       5. PROCEED otherwise
