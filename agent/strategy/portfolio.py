@@ -20,8 +20,10 @@ Circuit breaker note:
 """
 
 import logging
+import os
 import time as _time
 from dataclasses import dataclass, field
+from datetime import datetime
 from typing import Optional
 
 from data.allowlist import is_stablecoin
@@ -29,7 +31,7 @@ from data.allowlist import is_stablecoin
 log = logging.getLogger(__name__)
 
 # ── Competition limits ──
-MAX_TRADES_PER_DAY = 5
+MAX_TRADES_PER_DAY = int(os.getenv("AGENT_MAX_TRADES", "16"))
 
 # ── Safety constants ──
 SLIPPAGE_MULTIPLIER = 0.985   # 1.5% haircut: 0.25% DEX fee + slippage buffer
@@ -40,6 +42,9 @@ TRAILING_STOP_PCT = 0.05      # 5% below peak price → full exit
 
 # ── Penalty box ──
 COOLDOWN_SECONDS = 7200       # 2 hours — prevents re-buying a stopped-out token
+
+# ── Minimum hold duration (anti-churn) ──
+MIN_HOLD_SECONDS = 1800       # 30 min — don't sell a position for rotation if held < this
 
 
 # ── Data models ──
@@ -191,6 +196,21 @@ def generate_swap_plan(
         if sym in exited_tokens:
             continue
         if sym not in target_set:
+            # Skip recently-bought positions (anti-churn: give the trade time to develop)
+            entry_ts_str = info.get("entry_ts", "")
+            if entry_ts_str:
+                try:
+                    if entry_ts_str.endswith("Z"):
+                        entry_dt = datetime.fromisoformat(entry_ts_str.replace("Z", "+00:00"))
+                    else:
+                        entry_dt = datetime.fromisoformat(entry_ts_str)
+                    age_sec = now - entry_dt.timestamp()
+                    if age_sec < MIN_HOLD_SECONDS:
+                        log.info("  Holding %s: %ds old (< %ds min hold) — skipping rotation sell",
+                                 sym, int(age_sec), MIN_HOLD_SECONDS)
+                        continue
+                except (ValueError, TypeError):
+                    pass  # can't parse entry_ts, proceed with sell
             cost_usd = info.get("cost_basis_usd", 0)
             balance = info.get("balance", 0.0)
             if cost_usd <= 0 or balance <= 0:
