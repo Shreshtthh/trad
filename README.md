@@ -52,7 +52,8 @@ System requirements: Python 3.11+, `twak` CLI, `bnbagent-sdk` installed. Linux/m
                            | 5. Portfolio rebalancing + trailing stops               |
   DeepSeek LLM ---------- -| 6. Execute swap plan (TWAK, 8s delay)                   |
   (regime, hourly)         | 7. Log trades, update peak, save state                  |
-                           |                                                         |
+                           |                                                        
+                            |
   TWAK CLI -------------- -| SLEEP 900s -> REPEAT                                    |
   (swap + portfolio)       ----------------------------------------------------------
 ```
