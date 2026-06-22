@@ -3,7 +3,7 @@
 Orchestrator — 15-minute tick loop wiring all 7 phases together.
 
 Usage:
-    python3 main.py                        # live trading (default: 15-min loop)
+    python3 main.py                        # live trading (default: 10-min loop)
     python3 main.py --paper-trade          # dry-run mode (fake tx hashes)
     python3 main.py --once                 # run ONE tick then exit (debug)
     python3 main.py --interval 300         # custom tick interval (seconds)
@@ -43,7 +43,7 @@ from execution.guardrails import (
     MAX_TRADES_PER_DAY, DEFAULT_STATE_DIR,
 )
 from execution.twak_client import (
-    TwakClient, TradeResult, Holdings,
+    TwakClient, TradeResult, Holdings, resolve_address,
 )
 from strategy.regime import classify_regime, RegimeDecision
 from strategy.momentum import discover_candidates
@@ -59,7 +59,7 @@ logging.basicConfig(
 log = logging.getLogger("orchestrator")
 
 # ── Constants ──
-DEFAULT_INTERVAL_SECONDS = 900      # 15 minutes
+DEFAULT_INTERVAL_SECONDS = 600      # 10 minutes
 REGIME_REFRESH_INTERVAL = 3600      # re-classify regime every hour
 PRICE_REFRESH_SECONDS = 300         # refresh CMC prices every 5 min
 
@@ -95,7 +95,7 @@ class DeepSeekClient:
                     api_key=self._api_key,
                     base_url=self._base_url,
                 )
-                log.info("LLM: DeepSeek client ready (model=%s)", model)
+                log.debug("LLM: DeepSeek client ready (model=%s)", model)
             except ImportError:
                 log.warning(
                     "openai SDK not installed — regime classification will "
@@ -325,6 +325,14 @@ class Orchestrator:
         self._mcp = mcp_execute
         self._paper_trade = paper_trade
 
+        # Paper trade uses a separate state file so it never corrupts live data
+        self._state_dir = Path(
+            os.getenv("AGENT_STATE_DIR", str(DEFAULT_STATE_DIR))
+        )
+        if paper_trade:
+            self._state_dir = self._state_dir / "paper"
+        self._state_file = self._state_dir / "portfolio_state.json"
+
         # Volatile runtime cache (reset each tick)
         self._regime: Optional[RegimeDecision] = None
         self._last_regime_ts: float = 0.0
@@ -333,7 +341,7 @@ class Orchestrator:
         self._tick_count: int = 0
 
         # Ensure state directory exists
-        DEFAULT_STATE_DIR.mkdir(parents=True, exist_ok=True)
+        self._state_dir.mkdir(parents=True, exist_ok=True)
 
         log.info(
             "Orchestrator initialized: wallet=%s, paper=%s",
@@ -378,17 +386,110 @@ class Orchestrator:
         except KeyboardInterrupt:
             log.info("Orchestrator stopped by user (Ctrl+C)")
 
+    # ── Holdings refresh (every tick, live mode) ──────────────────────────
+
+    def _refresh_holdings(self, state: dict):
+        """
+        Fetch TWAK portfolio + merge state-tracked invisible tokens.
+
+        TWAK's token registry can't display many competition tokens (GUA,
+        SIREN, DEXE, BSB, etc.) — their balances don't appear in ``twak
+        wallet portfolio`` output even though the wallet holds them.  This
+        method merges TWAK-reported tokens (BNB, USDT) with state-carried
+        tokens so the bot always has a complete picture.
+
+        Side effects (intentional):
+          - state["holdings"] = merged dict
+          - state["current_value_usd"] = total (TWAK + invisible)
+          - update_peak(state, total)
+        """
+        if self._paper_trade:
+            return _build_holdings_from_state(state)
+
+        # ── Fetch TWAK portfolio ──────────────────────────────────────
+        try:
+            latest = self._twak.fetch_holdings()
+        except Exception as exc:
+            log.error("Holdings fetch failed: %s", exc)
+            # Fall back to state-only reconstruction
+            return _build_holdings_from_state(state)
+
+        old = state.get("holdings", {})
+
+        # Start with everything TWAK returned
+        merged = {sym: dict(info) for sym, info in latest.tokens.items()}
+        twak_syms = {s.upper() for s in merged}
+
+        # Carry forward peak_prices for tokens TWAK returned
+        for sym in merged:
+            old_info = old.get(sym, {})
+            stored_peak = old_info.get("peak_price", 0)
+            if stored_peak:
+                current_val = merged[sym].get("peak_price", 0) or 0
+                merged[sym]["peak_price"] = max(stored_peak, current_val)
+
+        # Preserve tokens TWAK did NOT return (invisible tokens)
+        for sym, info in old.items():
+            if sym.upper() not in twak_syms and sym.upper() != "BNB":
+                price = self._price_cache.get(sym.upper(), 0)
+                bal = info.get("balance", 0)
+                if bal > 0:
+                    info = dict(info)
+                    if price > 0:
+                        info["value_usd"] = bal * price
+                    merged[sym] = info
+
+        state["holdings"] = merged
+
+        # Compute total: TWAK total + invisible tokens' value
+        total = latest.total_value_usd
+        for sym, info in merged.items():
+            if sym.upper() not in twak_syms:
+                total += info.get("value_usd", info.get("cost_basis_usd", 0))
+
+        update_peak(state, total)
+        state["current_value_usd"] = total
+
+        # Build Holdings object for the rest of the tick
+        h = Holdings()
+        h.tokens = merged
+        h.total_value_usd = total
+        return h
+
     # ── Tick implementation ──────────────────────────────────────────────
 
     def _tick(self):
         """Run one full orchestrator tick."""
         # Step 1 — Load state
-        state = load_state()
+        state = load_state(self._state_file)
 
-        # Step 2 — Run guardrails (daily reset, drawdown, inactivity, quota)
+        # Step 2 — Refresh holdings (always, so manual trades are visible)
+        # Fetch TWAK portfolio + merge state-tracked invisible tokens.
+        # Updates state["holdings"], state["current_value_usd"], and peak.
+        holdings = self._refresh_holdings(state)
+
+        # Step 3 — If TWAK fetch failed fatally and we have no state, abort
+        if holdings is None:
+            log.error("Holdings unavailable — skipping tick")
+            save_state(state, self._state_file)
+            return
+
+        total_value = holdings.total_value_usd
+        if total_value <= 0:
+            log.warning("Portfolio value is $0 — skipping tick (no balance yet?)")
+            save_state(state, self._state_file)
+            return
+
+        log.info(
+            "Portfolio: $%.0f total (%d tokens), peak=$%.0f, drawdown=%.1f%%",
+            total_value, len(holdings.tokens),
+            state["peak_value_usd"], state["drawdown_pct"],
+        )
+
+        # Step 4 — Run guardrails (daily reset, drawdown, inactivity, quota)
         verdict = run_checks(state)
 
-        # Step 3 — SKIP_REBALANCE: nothing to do
+        # Step 5 — SKIP_REBALANCE: nothing to do
         if verdict.verdict == Verdict.SKIP_REBALANCE:
             if self._paper_trade:
                 log.info(
@@ -397,52 +498,26 @@ class Orchestrator:
                 )
             else:
                 log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
-                save_state(state)
+                save_state(state, self._state_file)
                 return
         else:
             log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
 
-        # Step 4 — Fetch holdings (or reconstruct from state in paper mode)
-        if self._paper_trade:
-            holdings = _build_holdings_from_state(state)
-            log.info(
-                "Paper holdings: %d tokens, $%.0f total",
-                len(holdings.tokens), holdings.total_value_usd,
-            )
-        else:
-            try:
-                holdings = self._twak.fetch_holdings()
-            except Exception as exc:
-                log.error("Holdings fetch failed: %s — skipping tick", exc)
-                save_state(state)
-                return
-
-        total_value = holdings.total_value_usd
-        if total_value <= 0:
-            log.warning("Portfolio value is $0 — skipping tick (no balance yet?)")
-            update_peak(state, 0)
-            save_state(state)
-            return
-
-        # Update peak tracking
-        state = update_peak(state, total_value)
-        log.info(
-            "Portfolio: $%.0f total, peak=$%.0f, drawdown=%.1f%%",
-            total_value, state["peak_value_usd"], state["drawdown_pct"],
-        )
-
-        # Step 5 — Handle heartbeat trade
+        # Step 6 — Handle heartbeat trade (return after — no full pipeline)
         if verdict.verdict == Verdict.COMPLIANCE_TRADE:
             self._handle_compliance(state)
-
-        # Step 6 — Circuit breaker: skip momentum + buys, run exits only
-        if verdict.verdict == Verdict.CIRCUIT_BREAKER:
-            self._tick_exits_only(state, holdings, total_value)
+            save_state(state, self._state_file)
             return
 
-        # Step 7 — PROCEED: full pipeline
+        # Step 7 — Circuit breaker: skip momentum + buys, run exits only
+        if verdict.verdict == Verdict.CIRCUIT_BREAKER:
+            self._tick_exits_only(state, holdings, total_value)
+            save_state(state, self._state_file)
+            return
 
-        # 7a — Regime classification (once per hour)
+        # Step 8 — PROCEED: full pipeline
+
+        # 8a — Regime classification (once per hour)
         if self._regime is None or (time.monotonic() - self._last_regime_ts) >= REGIME_REFRESH_INTERVAL:
             log.info("Running regime classification...")
             try:
@@ -464,7 +539,7 @@ class Orchestrator:
 
         regime = self._regime.regime if self._regime else "neutral"
 
-        # 7b — Momentum discovery
+        # 8b — Momentum discovery
         log.info("Running momentum discovery (regime=%s)...", regime)
         try:
             # Pass cooldowns from state for penalty box
@@ -478,18 +553,22 @@ class Orchestrator:
             )
         except Exception as exc:
             log.error("Momentum discovery crashed: %s — skipping tick", exc)
-            save_state(state)
+            save_state(state, self._state_file)
             return
 
         if momentum.error:
             log.warning("Momentum pipeline error: %s", momentum.error)
         if not momentum.candidates:
             log.info("No momentum candidates — HOLD (saving state)")
-            save_state(state)
+            save_state(state, self._state_file)
             return
 
         for i, c in enumerate(momentum.candidates):
-            log.info("  Candidate #%d: %s score=%.3f (%s)", i+1, c.symbol, c.composite_score, c.reason)
+            addr = resolve_address(c.symbol)
+            addr_str = f"  {addr}" if addr else ""
+            log.info("  Candidate #%d: %s%s score=%.3f 1h=+%.1f%% 24h=+%.1f%% vol=$%.0fk (%s)",
+                     i+1, c.symbol, addr_str, c.composite_score,
+                     c.pct_1h, c.pct_24h, c.vol_24h / 1000, c.reason)
 
         # 7c — Build price cache
         now = time.monotonic()
@@ -537,8 +616,17 @@ class Orchestrator:
         if not plan.swaps:
             log.info("Swap plan empty — nothing to execute")
             state["regime"] = regime
-            save_state(state)
+            save_state(state, self._state_file)
             return
+
+        # Log plan summary with addresses so you can track tokens
+        for si in plan.swaps:
+            addr = resolve_address(si.to_token if si.action == "buy" else si.from_token)
+            addr_str = f" ({addr})" if addr else ""
+            if si.action == "buy":
+                log.info("📈 BUY  $%.0f %s%s → %s  (%s)", si.amount_usd, si.from_token, addr_str, si.to_token, si.reason)
+            else:
+                log.info("📉 SELL %.0f %s%s → %s  (%s)", si.amount_token, si.from_token, addr_str, si.to_token, si.reason)
 
         results = self._twak.execute_plan(plan)
         successes = [r for r in results if r.success]
@@ -564,37 +652,90 @@ class Orchestrator:
 
         # Update holdings in state
         if self._paper_trade:
-            # Simulate balance changes from paper swaps (don't call fetch_holdings
-            # because the paper stub is stateless and always returns $10K USDT).
             _apply_paper_holdings(state, plan)
             total_value = _paper_total_value(state, self._price_cache)
             update_peak(state, total_value)
         else:
+            # ── Live mode: TWAK + state-tracked tokens ──────────────
+            # TWAK only reports tokens in its symbol registry. Competition
+            # tokens like GUA, DEXE, BSB are invisible to TWAK's portfolio
+            # display even though the swap succeeds. We must preserve these
+            # tokens from state so the bot knows it owns them.
+            #
+            # Strategy: TWAK tells us BNB + USDT balances (always accurate).
+            # State tells us volatile token positions (what we bought/sold).
+            # Merge both: TWAK overwrites known tokens, state preserves the
+            # tokens TWAK can't see.
             try:
                 latest = self._twak.fetch_holdings()
-                # Merge instead of overwrite: TWAK returns {balance, value_usd,
-                # cost_basis_usd} but does NOT include peak_price. If we naively
-                # assign state["holdings"] = latest.tokens, the trailing stop
-                # reference is destroyed every tick. Preserve peak_price from the
-                # prior state so trailing stops can track the actual peak.
-                old_holdings = state.get("holdings", {})
-                merged = {}
-                for sym, info in latest.tokens.items():
-                    merged[sym] = dict(info)
-                    old_info = old_holdings.get(sym, {})
+                old = state.get("holdings", {})
+
+                # Start with everything TWAK returned
+                merged = {sym: dict(info) for sym, info in latest.tokens.items()}
+
+                # Carry forward peak_prices for tokens TWAK returned
+                for sym in merged:
+                    old_info = old.get(sym, {})
                     stored_peak = old_info.get("peak_price", 0)
-                    # Carry forward the highest peak we have seen
                     if stored_peak:
-                        current_peak = latest.tokens[sym].get("peak_price", 0) or 0
-                        merged[sym]["peak_price"] = max(stored_peak, current_peak)
+                        current_val = merged[sym].get("peak_price", 0) or 0
+                        merged[sym]["peak_price"] = max(stored_peak, current_val)
+
+                # Preserve tokens TWAK did NOT return (invisible tokens)
+                twak_syms = {s.upper() for s in merged}
+                for sym, info in old.items():
+                    if sym.upper() not in twak_syms and sym.upper() != "BNB":
+                        # TWAK didn't see this token — carry it forward
+                        # Update its value from the price cache
+                        price = self._price_cache.get(sym.upper(), 0)
+                        bal = info.get("balance", 0)
+                        if price > 0 and bal > 0:
+                            info = dict(info)
+                            info["value_usd"] = bal * price
+                        merged[sym] = info
+
+                # Apply swap plan deltas ONLY for successfully executed swaps.
+                # Failed sells must NOT remove the token — it's still in wallet.
+                succeeded = {r.from_token.upper() for r in results if r.success and r.from_token}
+                succeeded |= {r.to_token.upper() for r in results if r.success and r.to_token}
+                for i, si in enumerate(plan.swaps):
+                    result = results[i] if i < len(results) else None
+                    if not result or not result.success:
+                        continue  # skip failed swaps entirely
+                    sym = si.to_token if si.action == "buy" else si.from_token
+                    if sym.upper() in _STABLES or sym == "BNB":
+                        continue
+                    if si.action == "buy":
+                        # Use result.amount_token for the actual received balance
+                        price = self._price_cache.get(sym.upper(), 0)
+                        received = result.amount_token if result.amount_token > 0 else si.amount_token
+                        merged[sym] = {
+                            "balance": received,
+                            "cost_basis_usd": si.amount_usd,
+                            "value_usd": si.amount_usd,
+                            "peak_price": price if price > 0 else (si.amount_usd / received if received > 0 else 0),
+                            "entry_ts": datetime.now(timezone.utc).isoformat(),
+                        }
+                    elif si.action == "sell":
+                        # Token sold — remove from state
+                        merged.pop(sym, None)
+                        merged.pop(sym.upper(), None)
+
                 state["holdings"] = merged
-                update_peak(state, latest.total_value_usd)
+
+                # Compute total: TWAK total + invisible tokens' market value
+                total = latest.total_value_usd
+                for sym, info in merged.items():
+                    if sym.upper() not in twak_syms:
+                        total += info.get("value_usd",
+                                          info.get("cost_basis_usd", 0))
+                update_peak(state, total)
             except Exception:
                 pass
 
         # Save final state
         state["regime"] = regime
-        save_state(state)
+        save_state(state, self._state_file)
 
         log.info(
             "Tick %d result: %d/%d swaps succeeded, %d failed",
@@ -624,7 +765,7 @@ class Orchestrator:
         all_symbols = list(holdings.tokens.keys())
         if not all_symbols:
             log.info("No holdings to check trailing stops against")
-            save_state(state)
+            save_state(state, self._state_file)
             return
 
         price_cache = _build_price_cache(holdings, [])
@@ -688,7 +829,7 @@ class Orchestrator:
 
         if not exit_plan.swaps:
             log.info("Circuit breaker: no trailing stops triggered — HOLD")
-            save_state(state)
+            save_state(state, self._state_file)
             return
 
         log.warning(
@@ -726,6 +867,208 @@ class Orchestrator:
 
 
 # ═══════════════════════════════════════════════════════════════════════════
+# Emergency Kill Switch
+# ═══════════════════════════════════════════════════════════════════════════
+
+_STABLES = {"USDT", "USDC", "DAI", "TUSD", "FDUSD", "FRAX",
+            "USDD", "USD1", "USDe", "USDf", "USDF",
+            "DUSD", "XUSD", "FRXUSD", "lisUSD", "STABLE"}
+
+def _emergency_sell_all(twak):
+    """
+    Emergency kill switch: sell every volatile token in the wallet to USDT.
+
+    Does NOT sell BNB (keeps gas) or stablecoins. Executes each sell
+    individually with a short delay between. Prints results and exits.
+
+    Merges TWAK portfolio (shows BNB, USDT) with state file (shows GUA,
+    SIREN, etc. that TWAK's token registry can't display) so no hidden
+    token is left behind.
+    """
+    import time as _time
+    log.warning("🛑 KILL SWITCH ACTIVATED — selling all volatile tokens to USDT")
+
+    # ── Load TWAK holdings (BNB, USDT, maybe others) ──
+    try:
+        holdings = twak.fetch_holdings()
+    except Exception as exc:
+        print(f"❌ Failed to fetch wallet: {exc}")
+        sys.exit(1)
+
+    tokens = dict(holdings.tokens)  # copy so we can mutate
+
+    # ── Merge state-file holdings for tokens TWAK can't see ──
+    state = load_state()
+    state_holdings = state.get("holdings", {})
+    twak_upper = {s.upper() for s in tokens}
+    merged_any = False
+    for sym, info in state_holdings.items():
+        sym_up = sym.upper()
+        if sym_up in twak_upper or sym_up in _STABLES or sym_up == "BNB":
+            continue
+        bal = float(info.get("balance", 0))
+        if bal <= 0:
+            continue
+        tokens[sym_up] = dict(info)
+        tokens[sym_up]["balance"] = bal
+        tokens[sym_up]["value_usd"] = float(info.get("value_usd", info.get("cost_basis_usd", 0)))
+        merged_any = True
+        log.info("KILL: merged hidden token %s (%.4f) from state file", sym_up, bal)
+
+    if merged_any:
+        log.warning("KILL: %d hidden tokens added — double-check balances on BSCscan!", sum(
+            1 for s in tokens if s.upper() not in twak_upper
+        ))
+
+    sold, failed, skipped = 0, 0, 0
+
+    for sym, info in tokens.items():
+        sym_up = sym.upper()
+        balance = float(info.get("balance", 0))
+
+        # Skip stablecoins and BNB gas
+        if sym_up in _STABLES or sym_up == "BNB":
+            skipped += 1
+            continue
+
+        if balance <= 0:
+            skipped += 1
+            continue
+
+        log.warning("KILL: selling %.6f %s → USDT", balance, sym)
+        swap = {
+            "action": "sell",
+            "from_token": sym,
+            "to_token": "USDT",
+            "amount_token": balance,
+            "amount_usd": float(info.get("value_usd", 0)),
+            "reason": "KILL SWITCH: emergency sell-all",
+        }
+
+        try:
+            result = twak.execute_swap(swap)
+            if result.success:
+                log.warning("  ✅ SOLD %s: tx=%s", sym, result.tx_hash)
+                sold += 1
+            else:
+                log.error("  ❌ FAILED %s: %s", sym, result.error)
+                failed += 1
+        except Exception as exc:
+            log.error("  ❌ EXCEPTION selling %s: %s", sym, exc)
+            failed += 1
+
+        remaining = sum(1 for s in tokens if s.upper() not in _STABLES and s.upper() != "BNB"
+                        and float(tokens[s].get("balance", 0)) > 0)
+        if sold + failed < remaining:
+            _time.sleep(8)
+
+    # ── Refresh holdings and update state file ──
+    try:
+        final_holdings = twak.fetch_holdings()
+        state["holdings"] = dict(final_holdings.tokens)
+        state["current_value_usd"] = final_holdings.total_value_usd
+        state["peak_value_usd"] = max(
+            state.get("peak_value_usd", 0), final_holdings.total_value_usd
+        )
+        state["drawdown_pct"] = (
+            0.0 if state["peak_value_usd"] <= 0
+            else 1.0 - state["current_value_usd"] / state["peak_value_usd"]
+        )
+        state["emergency_triggered"] = True
+        save_state(state)
+        print("✅ State file updated")
+    except Exception as exc:
+        print(f"⚠️  Could not update state file: {exc}")
+
+    print(f"\n🛑 Kill switch complete: {sold} sold, {failed} failed, {skipped} skipped")
+    if sold > 0:
+        print("✅ Remaining balance should be USDT + BNB. Check with:")
+        print("   twak wallet portfolio --chains bsc --json")
+
+
+def _update_state_from_wallet(twak):
+    """
+    Fetch TWAK portfolio, merge with state-tracked invisible tokens,
+    and save to portfolio_state.json.  Use after manual TWAK swaps so
+    the bot's next tick reflects your trades.
+    """
+    print("📡 Fetching wallet from TWAK...")
+    try:
+        latest = twak.fetch_holdings()
+    except Exception as exc:
+        print(f"❌ Failed: {exc}")
+        sys.exit(1)
+
+    state = load_state()
+    old = state.get("holdings", {})
+
+    merged = {sym: dict(info) for sym, info in latest.tokens.items()}
+    twak_syms = {s.upper() for s in merged}
+
+    # Carry forward peak_prices
+    for sym in merged:
+        old_info = old.get(sym, {})
+        stored_peak = old_info.get("peak_price", 0)
+        if stored_peak:
+            current_val = merged[sym].get("peak_price", 0) or 0
+            merged[sym]["peak_price"] = max(stored_peak, current_val)
+
+    # Preserve invisible tokens
+    for sym, info in old.items():
+        if sym.upper() not in twak_syms and sym.upper() != "BNB":
+            bal = info.get("balance", 0)
+            if bal > 0:
+                merged[sym] = dict(info)
+
+    state["holdings"] = merged
+
+    total = latest.total_value_usd
+    for sym, info in merged.items():
+        if sym.upper() not in twak_syms:
+            total += info.get("value_usd", info.get("cost_basis_usd", 0))
+
+    state["current_value_usd"] = total
+    state["peak_value_usd"] = max(state.get("peak_value_usd", 0), total)
+    state["drawdown_pct"] = (
+        0.0 if state["peak_value_usd"] <= 0
+        else 1.0 - state["current_value_usd"] / state["peak_value_usd"]
+    )
+
+    save_state(state)
+    print(f"✅ State updated: {len(merged)} tokens, ${total:.2f} total")
+    for sym, info in merged.items():
+        bal = info.get("balance", 0)
+        val = info.get("value_usd", info.get("cost_basis_usd", "?"))
+        print(f"   {sym}: {bal:.6f} (~${val:.2f})")
+    print(f"   peak=${state['peak_value_usd']:.2f}, drawdown={state['drawdown_pct']:.1%}")
+
+
+def _remove_holding_from_state(symbol: str):
+    """Remove a single token from state/portfolio_state.json."""
+    sym = symbol.upper()
+    state = load_state()
+    old = state.get("holdings", {})
+
+    if sym not in old:
+        # Also try case-insensitive
+        match = next((k for k in old if k.upper() == sym), None)
+        if match:
+            sym = match
+        else:
+            print(f"⚠️  {symbol} not found in holdings: {list(old.keys())}")
+            sys.exit(1)
+
+    removed = old.pop(sym)
+    bal = removed.get("balance", 0)
+    val = removed.get("value_usd", removed.get("cost_basis_usd", 0))
+    print(f"🗑️  Removed {sym}: balance={bal}, value=${val:.2f}")
+
+    state["holdings"] = old
+    save_state(state)
+    print(f"✅ State saved — now holding: {list(old.keys())}")
+
+
+# ═══════════════════════════════════════════════════════════════════════════
 # CLI Entry Point
 # ═══════════════════════════════════════════════════════════════════════════
 
@@ -735,10 +1078,12 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  python3 main.py                         live trading, 15-min loop
+  python3 main.py                         live trading, 10-min loop
   python3 main.py --paper-trade           dry-run (fake transactions)
   python3 main.py --once --paper-trade    single dry-run tick
   python3 main.py --interval 300          custom 5-min interval
+  python3 main.py --kill-switch           emergency: sell EVERYTHING to USDT
+  python3 main.py --update-state          sync state after manual trades
         """,
     )
     parser.add_argument(
@@ -751,7 +1096,19 @@ Examples:
     )
     parser.add_argument(
         "--interval", type=float, default=DEFAULT_INTERVAL_SECONDS,
-        help=f"Seconds between ticks (default: {DEFAULT_INTERVAL_SECONDS}, 15 min)",
+        help=f"Seconds between ticks (default: {DEFAULT_INTERVAL_SECONDS}, 10 min)",
+    )
+    parser.add_argument(
+        "--kill-switch", action="store_true",
+        help="EMERGENCY: sell all volatile tokens to USDT immediately and exit",
+    )
+    parser.add_argument(
+        "--update-state", action="store_true",
+        help="Fetch TWAK portfolio + merge invisible tokens → save state, then exit",
+    )
+    parser.add_argument(
+        "--remove-holding", type=str, metavar="SYMBOL",
+        help="Remove a token from state (use after manually selling a token TWAK can't see)",
     )
     parser.add_argument(
         "--twak-bin", default="twak",
@@ -776,11 +1133,32 @@ Examples:
         sys.exit(1)
 
     # ── Bootstrap components ──────────────────────────────────────────
-    log.info("Bootstrapping orchestrator...")
+    log.debug("Bootstrapping orchestrator...")
 
     llm = DeepSeekClient()
     twak = TwakClient.from_env(twak_bin=args.twak_bin, paper_trade=args.paper_trade)
-    log.info("Wallet: %s (paper=%s)", twak.wallet_address, args.paper_trade)
+    log.debug("Wallet: %s (paper=%s)", twak.wallet_address, args.paper_trade)
+
+    # ── Kill switch: sell everything to USDT ─────────────────────────────
+    if args.kill_switch:
+        if twak._paper_trade:
+            print("❌ Kill switch requires live mode (no --paper-trade)")
+            sys.exit(1)
+        _emergency_sell_all(twak)
+        return
+
+    # ── Update state: fetch + merge + save (for after manual trades) ──
+    if args.update_state:
+        if twak._paper_trade:
+            print("❌ --update-state requires live mode (no --paper-trade)")
+            sys.exit(1)
+        _update_state_from_wallet(twak)
+        return
+
+    # ── Remove holding (for after manually selling an invisible token) ──
+    if args.remove_holding:
+        _remove_holding_from_state(args.remove_holding)
+        return
 
     # MCP executor: the orchestrator expects a callable.
     # For live runs, this is the CMC MCP tool from the skill hub.
@@ -802,7 +1180,7 @@ def _build_mcp_executor(paper_trade: bool) -> Callable:
     # Only fall back to a stub when CMC_API_KEY is not configured at all.
     try:
         from data.cmc_client import cmc_mcp_bridge
-        log.info("MCP: CMC bridge ready (real market data)")
+        log.debug("MCP: CMC bridge ready (real market data)")
         return cmc_mcp_bridge
     except ImportError:
         log.warning(
