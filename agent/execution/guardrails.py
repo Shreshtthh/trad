@@ -9,7 +9,7 @@ Order of checks (fast-fail):
   1. Drawdown monitor: if current_value < 0.75 × peak → CIRCUIT_BREAKER
   2. Trade counter reset: if UTC date changed → trades_today = 0
   3. Inactivity fallback: if >20h since last_trade_ts → COMPLIANCE_TRADE
-  4. Quota check: if trades_today >= 5 → SKIP_REBALANCE
+  4. Quota check: if trades_today >= MAX_TRADES_PER_DAY → SKIP_REBALANCE
   5. Otherwise → PROCEED to momentum/portfolio/execution
 """
 
@@ -29,7 +29,7 @@ log = logging.getLogger(__name__)
 # ── Constants ──
 MAX_DRAWDOWN_PCT = 0.25          # 25% from peak → emergency
 INACTIVITY_HOURS = 18             # force heartbeat after 18h idle (hackathon rule)
-MAX_TRADES_PER_DAY = 5
+MAX_TRADES_PER_DAY = int(os.getenv("AGENT_MAX_TRADES", "16"))
 MIN_TRADE_USD = 5.0               # compliance trade size
 COMPLIANCE_FROM = "USDT"          # compliance swap from
 COMPLIANCE_TO = "FDUSD"           # compliance swap to
