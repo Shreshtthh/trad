@@ -57,6 +57,42 @@ SWAP_DELAY_SECONDS = 8       # delay between sequential swaps (nonce safety)
 SWAP_TIMEOUT_SECONDS = 120   # hard timeout per swap (RPC stall protection)
 FETCH_TIMEOUT_SECONDS = 30   # hard timeout for portfolio fetch
 
+# ── Slippage (TWAK --slippage flag) ──
+# Tight (1%) for sells into USDT — deep liquidity, minimal price impact.
+# Looser (5%) for buys into meme coins — BSC pools can be thin, and
+# reverting on every volatile tick wastes gas. Still strict enough that
+# a sandwich attack needs >5% to be profitable, which triggers the revert.
+SELL_SLIPPAGE_PCT = 1        # USDT pairs are liquid
+BUY_SLIPPAGE_PCT = 5         # meme coins need breathing room
+
+# ── BSC token address registry ──
+# TWAK doesn't know every competition-token symbol. When a token is not
+# in TWAK's symbol table, the swap command must pass the contract address
+# (0x...) instead. This dict maps COMP_TOKEN symbol → BSC contract address.
+_BSC_ADDRESSES: dict[str, str] = {}
+_ADDRESS_PATH = Path(__file__).resolve().parent.parent / "data" / "bsc_addresses.json"
+try:
+    with open(_ADDRESS_PATH) as f:
+        _BSC_ADDRESSES = json.load(f)
+    log.info("BSC address registry: %d tokens loaded", len(_BSC_ADDRESSES))
+except (OSError, json.JSONDecodeError):
+    log.warning("BSC address registry not found at %s — some swaps may fail", _ADDRESS_PATH)
+
+
+def resolve_address(symbol: str) -> str:
+    """Public helper: return BSC contract address for a symbol, or empty string if unknown."""
+    sym = symbol.upper()
+    addr = _BSC_ADDRESSES.get(sym)
+    if addr:
+        return addr
+    for key, val in _BSC_ADDRESSES.items():
+        if key.upper() == sym:
+            return val
+    return ""
+
+# ── TWAK chain id ──
+BSC_CHAIN = "bsc"            # BNB Smart Chain mainnet
+
 # ── x402 payment limits (CMC API calls) ──
 # Values in raw base units of the BSC mainnet U-token (6 decimals).
 # 1 USDC-equivalent = 1_000_000 base units.
@@ -123,11 +159,13 @@ class TwakClient:
         *,
         twak_bin: str = "twak",
         paper_trade: bool = False,
+        wallet_password: str | None = None,
     ) -> None:
         self._wallet = wallet
         self._x402 = x402_signer
         self._twak_bin = twak_bin
         self._paper_trade = paper_trade
+        self._wallet_password = wallet_password
 
         # Verify twak CLI is reachable
         if not paper_trade and not self._twak_found():
@@ -170,41 +208,58 @@ class TwakClient:
         private_key = os.getenv("PRIVATE_KEY") or None
         address = os.getenv("WALLET_ADDRESS") or None
 
-        # If no private key and no address, try auto-select (works if exactly one keystore exists)
-        if not private_key and not address:
-            if EVMWalletProvider.keystore_exists():
-                log.info("No PRIVATE_KEY or WALLET_ADDRESS set — auto-selecting sole keystore")
-            else:
+        # TWAK manages its own keystore at ~/.twak/wallet.json.
+        # bnbagent keystore (~/.bnbagent/wallets/) is only needed for x402
+        # signing, which the bot doesn't use (CMC_API_KEY handles API auth).
+        # If no bnbagent keystore exists, use a lightweight stub — TWAK CLI
+        # handles all swap execution and portfolio queries independently.
+        wallet = None
+        x402_signer = None
+
+        try:
+            wallet = EVMWalletProvider(
+                password=password,
+                private_key=private_key,
+                address=address,
+            )
+            log.info("Wallet loaded: %s (source=%s)", wallet.address, wallet.source)
+
+            bsc_mainnet = get_address(BSC_MAINNET_CHAIN_ID)
+            payment_token = bsc_mainnet.payment_token
+
+            max_per_call = int(os.getenv("X402_MAX_VALUE_PER_CALL", str(CMC_MAX_VALUE_PER_CALL)))
+            session_budget = int(os.getenv("X402_SESSION_BUDGET", str(CMC_SESSION_BUDGET)))
+
+            x402_signer = X402Signer(
+                wallet,
+                max_value_per_call={payment_token: max_per_call},
+                session_budget={payment_token: session_budget},
+            )
+            log.info(
+                "X402Signer ready: max_per_call=%d, session_budget=%d, token=%s",
+                max_per_call, session_budget, payment_token,
+            )
+        except Exception as exc:
+            # bnbagent keystore not available — TWAK handles keys independently.
+            # x402 signing will be unavailable but the bot uses CMC_API_KEY.
+            log.info(
+                "bnbagent wallet not available (%s). Using TWAK-managed wallet: %s. "
+                "Swap execution and portfolio queries will work normally.",
+                exc, address or "auto-detected",
+            )
+            if not address:
                 raise ValueError(
-                    "No PRIVATE_KEY set and no keystore found in ~/.bnbagent/wallets/. "
-                    "Set PRIVATE_KEY on first run to import and encrypt the wallet."
-                )
+                    "No WALLET_ADDRESS set and bnbagent keystore unavailable. "
+                    "Set WALLET_ADDRESS to your BSC address so TWAK can use it."
+                ) from exc
+            # Stub wallet with just the address (TWAK has the real keys)
+            wallet = type("_TwakWallet", (), {"address": address})()
+            x402_signer = type("_NoX402", (), {
+                "budget": type("_Budget", (), {"spent": lambda self, token: 0})(),
+            })()
 
-        wallet = EVMWalletProvider(
-            password=password,
-            private_key=private_key,
-            address=address,
-        )
-        log.info("Wallet loaded: %s (source=%s)", wallet.address, wallet.source)
-
-        # Payment token for BSC mainnet
-        bsc_mainnet = get_address(BSC_MAINNET_CHAIN_ID)
-        payment_token = bsc_mainnet.payment_token
-
-        max_per_call = int(os.getenv("X402_MAX_VALUE_PER_CALL", str(CMC_MAX_VALUE_PER_CALL)))
-        session_budget = int(os.getenv("X402_SESSION_BUDGET", str(CMC_SESSION_BUDGET)))
-
-        x402_signer = X402Signer(
-            wallet,
-            max_value_per_call={payment_token: max_per_call},
-            session_budget={payment_token: session_budget},
-        )
-        log.info(
-            "X402Signer ready: max_per_call=%d, session_budget=%d, token=%s",
-            max_per_call, session_budget, payment_token,
-        )
-
-        return cls(wallet, x402_signer, twak_bin=twak_bin, paper_trade=paper_trade)
+        return cls(wallet, x402_signer, twak_bin=twak_bin, paper_trade=paper_trade,
+                   wallet_password=password)
 
     @classmethod
     def _paper_from_env(cls, *, twak_bin: str = "twak") -> "TwakClient":
@@ -234,6 +289,21 @@ class TwakClient:
 
     # ── TWAK CLI helpers ─────────────────────────────────────────────────
 
+    @staticmethod
+    def _mask_password(cmd: list[str]) -> list[str]:
+        """Replace --password <value> with --password *** in a command list."""
+        masked = list(cmd)
+        for i, arg in enumerate(masked):
+            if arg == "--password" and i + 1 < len(masked):
+                masked[i + 1] = "***"
+        return masked
+
+    def _mask_stderr(self, text: str) -> str:
+        """Redact wallet password from stderr if present."""
+        if self._wallet_password and self._wallet_password in text:
+            return text.replace(self._wallet_password, "***")
+        return text
+
     def _twak_found(self) -> bool:
         """Check if the TWAK CLI binary is reachable."""
         try:
@@ -248,7 +318,9 @@ class TwakClient:
     def _run_twak(self, args: list[str], timeout: int = 120) -> subprocess.CompletedProcess:
         """Run a TWAK CLI command. Raises RuntimeError on failure."""
         cmd = [self._twak_bin] + args
-        log.info("TWAK: %s", " ".join(cmd))
+        # Mask password in log output
+        display = self._mask_password(cmd)
+        log.debug("TWAK: %s", " ".join(display))
         try:
             result = subprocess.run(
                 cmd, capture_output=True, text=True, timeout=timeout,
@@ -259,12 +331,13 @@ class TwakClient:
                 f"Install TWAK or set paper_trade=True for offline mode."
             )
         except subprocess.TimeoutExpired:
-            raise RuntimeError(f"TWAK command timed out after {timeout}s: {' '.join(cmd)}")
+            raise RuntimeError(f"TWAK command timed out after {timeout}s: {' '.join(display)}")
 
         if result.returncode != 0:
+            stderr_text = result.stderr or ""
             raise RuntimeError(
                 f"TWAK command failed (exit={result.returncode}): "
-                f"{' '.join(cmd)}\nstderr: {result.stderr.strip()}"
+                f"{' '.join(display)}\nstderr: {self._mask_stderr(stderr_text.strip())}"
             )
         return result
 
@@ -276,6 +349,29 @@ class TwakClient:
         if isinstance(obj, dict):
             return obj.get(field, default)
         return getattr(obj, field, default)
+
+    def _resolve_token(self, symbol: str) -> str:
+        """
+        Resolve a token symbol to a BSC contract address when available.
+
+        TWAK accepts both symbols (e.g. "USDT") and contract addresses
+        (e.g. "0x55d398..."). Some  competition tokens (DEXE, GUA, etc.)
+        are not in TWAK's symbol registry — for those we MUST pass the
+        contract address. For well-known tokens (USDT, BNB, CAKE), the
+        symbol alone works.
+
+        Returns the contract address if found in the BSC registry, or the
+        original symbol if not — TWAK will try symbol lookup as fallback.
+        """
+        sym_upper = symbol.upper()
+        addr = _BSC_ADDRESSES.get(sym_upper)
+        if addr:
+            return addr
+        # Also try case-preserving lookup (BabyDoge, lisUSD, etc.)
+        for key, val in _BSC_ADDRESSES.items():
+            if key.upper() == sym_upper:
+                return val
+        return symbol
 
     def execute_swap(self, instruction) -> TradeResult:
         """
@@ -290,8 +386,20 @@ class TwakClient:
         Returns:
             TradeResult with tx_hash on success.
 
-        The TWAK CLI command is:
-            twak swap --amount <amount_token> --from <from_token> --to <to_token>
+        TWAK CLI format (positional args, NOT --amount/--from/--to flags):
+
+            Buy (stablecoin → token):
+                twak swap --chain bsc --usd <amount_usd> --slippage 5
+                          <from_token> <to_token> --password <pwd>
+
+            Sell (token → stablecoin):
+                twak swap --chain bsc <amount_token> <from_token> <to_token>
+                          --slippage 1 --password <pwd>
+
+        The --usd flag tells TWAK to calculate the source-token amount from a
+        USD oracle price. This avoids the bug where amount_token is in
+        destination-token units (from CMC pricing) but TWAK expects source-
+        token units for the positional amount argument.
         """
         _ = self._get_field  # short alias
         action = _(instruction, "action")
@@ -300,16 +408,28 @@ class TwakClient:
         amount = _(instruction, "amount_token", 0)
         amount_usd = _(instruction, "amount_usd", 0)
 
-        if amount <= 0:
+        # Resolve symbols to BSC contract addresses when available.
+        # TWAK may not know obscure competition tokens by symbol.
+        from_resolved = self._resolve_token(from_tok)
+        to_resolved = self._resolve_token(to_tok)
+        if from_resolved != from_tok or to_resolved != to_tok:
+            log.debug("Token resolution: %s→%s, %s→%s",
+                      from_tok, from_resolved, to_tok, to_resolved)
+
+        if amount <= 0 and amount_usd <= 0:
             return TradeResult(
                 success=False, from_token=from_tok, to_token=to_tok,
                 amount_token=amount, error="Amount must be > 0",
             )
 
+        is_buy = (action == "buy")
+        effective_amount = amount_usd if is_buy else amount
+
         if self._paper_trade:
             log.info(
                 "PAPER TRADE: %s %s → %s (%.6f tokens, ~$%.2f)",
-                action.upper() if action else "swap", from_tok, to_tok, amount, amount_usd,
+                action.upper() if action else "swap", from_tok, to_tok,
+                amount, amount_usd,
             )
             return TradeResult(
                 success=True,
@@ -317,30 +437,54 @@ class TwakClient:
                 from_token=from_tok, to_token=to_tok, amount_token=amount,
             )
 
-        try:
-            result = self._run_twak([
-                "swap",
-                "--amount", str(amount),
-                "--from", from_tok,
-                "--to", to_tok,
-            ], timeout=SWAP_TIMEOUT_SECONDS)
+        # ── Build TWAK CLI args ────────────────────────────────────────
+        slippage = BUY_SLIPPAGE_PCT if is_buy else SELL_SLIPPAGE_PCT
+        cmd = ["swap", "--chain", BSC_CHAIN]
 
+        if is_buy:
+            # Use --usd: amount is in USD, TWAK calculates source tokens
+            cmd += ["--usd", str(amount_usd)]
+        cmd += [
+            "--slippage", str(slippage),
+        ]
+
+        # Positional args: <amountOrFrom> <fromOrTo> [to]
+        # With --usd:  <from> <to>  (amount from --usd flag)
+        # Without:     <amount> <from> <to>
+        if is_buy:
+            cmd += [from_resolved, to_resolved]
+        else:
+            cmd += [str(amount), from_resolved, to_resolved]
+
+        # Wallet password (required for execution)
+        if self._wallet_password:
+            cmd += ["--password", self._wallet_password]
+
+        try:
+            result = self._run_twak(cmd, timeout=SWAP_TIMEOUT_SECONDS)
             # Parse tx hash from TWAK output
             tx_hash = self._parse_tx_hash(result.stdout)
+            # Show contract address for tokens TWAK resolves to address
+            extra = ""
+            if from_resolved.startswith("0x") and from_resolved != from_tok:
+                extra = f" ({from_resolved})"
+            elif to_resolved.startswith("0x") and to_resolved != to_tok:
+                extra = f" ({to_resolved})"
             log.info(
-                "EXECUTED: %s %.6f %s → %s | tx=%s",
-                action.upper(), amount, from_tok, to_tok, tx_hash,
+                "EXECUTED: %s %.6f %s%s → %s | tx=%s",
+                action.upper(), effective_amount, from_tok, extra, to_tok, tx_hash,
             )
             return TradeResult(
                 success=True, tx_hash=tx_hash,
-                from_token=from_tok, to_token=to_tok, amount_token=amount,
+                from_token=from_tok, to_token=to_tok,
+                amount_token=effective_amount,
             )
 
         except RuntimeError as exc:
             log.error("Swap execution failed: %s", exc)
             return TradeResult(
                 success=False, from_token=from_tok, to_token=to_tok,
-                amount_token=amount, error=str(exc),
+                amount_token=effective_amount, error=str(exc),
             )
 
     def _parse_tx_hash(self, stdout: str) -> Optional[str]:
@@ -384,15 +528,19 @@ class TwakClient:
             h.total_value_usd = 10_000.0
             return h
 
-        # Try JSON format first (TWAK may support --format json)
+        # Try JSON format first
         raw_stdout: str = ""
+        base_args = ["wallet", "portfolio", "--chains", BSC_CHAIN]
+        if self._wallet_password:
+            base_args += ["--password", self._wallet_password]
+
         for attempt, extra_args in enumerate([
-            ["--format", "json"],
+            ["--json"],
             [],   # fallback: plain text
         ]):
             try:
                 result = self._run_twak(
-                    ["wallet", "portfolio"] + extra_args,
+                    base_args + extra_args,
                     timeout=FETCH_TIMEOUT_SECONDS,
                 )
                 raw_stdout = result.stdout.strip()
@@ -424,42 +572,77 @@ class TwakClient:
     def _parse_holdings(self, stdout: str) -> Holdings:
         """Parse TWAK portfolio output into Holdings dataclass.
 
-        Tries JSON first (TWAK --format json), then falls back to regex
-        table parsing. Logs the raw output when both paths fail so the
-        operator can diagnose CLI format changes.
+        Tries JSON first (TWAK --json), then falls back to regex
+        table parsing.
+
+        TWAK --json output is a flat array:
+            [{"chain","type","symbol","address","balance","usdValue"}, ...]
+        Plain-text table output:
+            Chain        Type    Symbol            Balance               USD
+            ──────────────────────────────────────────────────────────────
+            bsc          native  BNB               0.0050019...          $2.96
+            bsc          token   USDT              200                   $199.75
         """
         holdings = Holdings(raw_output=stdout)
 
-        # Try JSON first (--format json output)
+        # ── Path 1: JSON array ───────────────────────────────────────
         try:
             data = json.loads(stdout)
         except json.JSONDecodeError:
             data = None
 
-        if isinstance(data, dict):
-            tokens_list = data.get("tokens") or data.get("holdings") or []
-            for entry in tokens_list:
-                sym = entry.get("symbol") or entry.get("token", "?")
+        if isinstance(data, list):
+            total = 0.0
+            for entry in data:
+                sym = entry.get("symbol", "?")
+                bal = float(entry.get("balance", 0))
+                val = float(entry.get("usdValue", 0))
                 holdings.tokens[sym] = {
-                    "balance": float(entry.get("balance", 0)),
-                    "value_usd": float(entry.get("value_usd") or entry.get("value", 0)),
-                    "cost_basis_usd": float(entry.get("cost_basis_usd") or entry.get("cost_basis", 0)),
+                    "balance": bal,
+                    "value_usd": val,
+                    "cost_basis_usd": val,
                 }
-            holdings.total_value_usd = float(data.get("total_value_usd") or data.get("total", 0))
+                total += val
+            holdings.total_value_usd = total
             return holdings
 
-        # Table fallback: whitespace-separated columns
-        # Matches lines like "BNB   3.5   1050.00" or "CAKE   500.00000000   1200.50"
+        if isinstance(data, dict):
+            tokens_list = data.get("tokens") or data.get("holdings") or []
+            total = 0.0
+            for entry in tokens_list:
+                sym = entry.get("symbol") or entry.get("token", "?")
+                val = float(entry.get("value_usd") or entry.get("value", 0))
+                holdings.tokens[sym] = {
+                    "balance": float(entry.get("balance", 0)),
+                    "value_usd": val,
+                    "cost_basis_usd": float(entry.get("cost_basis_usd") or entry.get("cost_basis", 0)),
+                }
+                total += val
+            holdings.total_value_usd = total
+            return holdings
+
+        # ── Path 2: Plain-text table ───────────────────────────────
+        # Format:  chain  type  SYMBOL  BALANCE  $USD_VALUE
+        # Header/Separator rows contain "Chain", "───", or "────"
         import re
+        # Match lines with a token symbol (all-caps or mixed), a numeric balance,
+        # and a $-prefixed USD value at the end.
         token_pattern = re.compile(
-            r'^\s*([A-Za-z0-9一-鿿]+)\s+([\d.]+)\s+([\d.]+)',
+            r'\b([A-Z]{2,20})\b\s+([\d.]+)\s+\$?([\d.]+)',
         )
         for line in stdout.splitlines():
-            m = token_pattern.match(line)
+            # Skip header, separator, and total rows
+            if "───" in line or "Chain" in line or "Type" in line:
+                continue
+            # Skip lines that are just separator dashes
+            stripped = line.strip()
+            if not stripped or stripped.startswith("─"):
+                continue
+
+            m = token_pattern.search(line)
             if m:
                 sym = m.group(1)
-                # Skip header rows that happen to match the pattern
-                if sym.lower() in ("token", "symbol", "asset", "name", "---", "total"):
+                if sym.lower() in ("total", "chain", "type"):
                     continue
                 balance = float(m.group(2))
                 value = float(m.group(3))
