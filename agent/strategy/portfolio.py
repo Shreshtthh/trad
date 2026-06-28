@@ -38,13 +38,20 @@ SLIPPAGE_MULTIPLIER = 0.985   # 1.5% haircut: 0.25% DEX fee + slippage buffer
 BNB_GAS_BUFFER_USD = 20.0     # minimum BNB to leave for gas (never sell below this)
 
 # ── Trailing stop ──
-TRAILING_STOP_PCT = 0.05      # 5% below peak price → full exit
+TRAILING_STOP_PCT = 0.07      # 7% below peak price → full exit
 
 # ── Penalty box ──
 COOLDOWN_SECONDS = 7200       # 2 hours — prevents re-buying a stopped-out token
 
 # ── Minimum hold duration (anti-churn) ──
-MIN_HOLD_SECONDS = 1800       # 30 min — don't sell a position for rotation if held < this
+MIN_HOLD_SECONDS = 10800      # 3 hours — don't sell a position for rotation if held < this
+
+# ── Rank hysteresis (anti-churn) ──
+# Entry: token must be in top 2. Exit: must drop below top 5 AND lose >50%
+# of the #1 candidate's score. This prevents selling tokens that are still
+# competitive but briefly fell to rank #3–5 on a noisy tick.
+ROTATION_EXIT_RANK = 5        # must fall below this rank to be eligible for rotation sell
+ROTATION_EXIT_SCORE_FLOOR = 0.30  # must have <30% of #1's score to be rotation-exited
 
 
 # ── Data models ──
@@ -189,6 +196,14 @@ def generate_swap_plan(
     per_position = deployable / max(len(target_set), 1)
 
     # ════════════════════════════════════════════════════════════════
+    # Build rank map for hysteresis: {symbol: (rank, score)}
+    # ════════════════════════════════════════════════════════════════
+    candidate_rank: dict[str, tuple[int, float]] = {}
+    top_score = candidates[0].acceleration_score if candidates else 0
+    for i, c in enumerate(candidates):
+        candidate_rank[c.symbol] = (i + 1, c.acceleration_score)
+
+    # ════════════════════════════════════════════════════════════════
     # REGULAR SELL candidates: holdings NOT in target set
     # ════════════════════════════════════════════════════════════════
     sell_candidates: list[SwapInstruction] = []
@@ -196,7 +211,7 @@ def generate_swap_plan(
         if sym in exited_tokens:
             continue
         if sym not in target_set:
-            # Skip recently-bought positions (anti-churn: give the trade time to develop)
+            # Guard 1 — Min hold time (30 min)
             entry_ts_str = info.get("entry_ts", "")
             if entry_ts_str:
                 try:
@@ -210,7 +225,18 @@ def generate_swap_plan(
                                  sym, int(age_sec), MIN_HOLD_SECONDS)
                         continue
                 except (ValueError, TypeError):
-                    pass  # can't parse entry_ts, proceed with sell
+                    pass  # can't parse entry_ts, proceed
+
+            # Guard 2 — Rank hysteresis (don't sell tokens still in top N)
+            rank_info = candidate_rank.get(sym)
+            if rank_info:
+                rank, score = rank_info
+                if rank <= ROTATION_EXIT_RANK and top_score > 0 and score >= top_score * ROTATION_EXIT_SCORE_FLOOR:
+                    log.info("  Holding %s: rank #%d (≤%d exit rank), score=%.2f (≥%.0f%% of leader %.2f) — skipping rotation sell",
+                             sym, rank, ROTATION_EXIT_RANK, score,
+                             ROTATION_EXIT_SCORE_FLOOR * 100, top_score)
+                    continue
+
             cost_usd = info.get("cost_basis_usd", 0)
             balance = info.get("balance", 0.0)
             if cost_usd <= 0 or balance <= 0:
