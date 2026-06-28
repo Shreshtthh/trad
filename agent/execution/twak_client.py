@@ -62,7 +62,7 @@ FETCH_TIMEOUT_SECONDS = 30   # hard timeout for portfolio fetch
 # Looser (5%) for buys into meme coins — BSC pools can be thin, and
 # reverting on every volatile tick wastes gas. Still strict enough that
 # a sandwich attack needs >5% to be profitable, which triggers the revert.
-SELL_SLIPPAGE_PCT = 1        # USDT pairs are liquid
+SELL_SLIPPAGE_PCT = 5        # competition tokens have thin liquidity — 5% needed
 BUY_SLIPPAGE_PCT = 5         # meme coins need breathing room
 
 # ── BSC token address registry ──
@@ -125,6 +125,7 @@ class TradeResult:
     from_token: str = ""
     to_token: str = ""
     amount_token: float = 0.0
+    output_amount: float = 0.0   # actual tokens received (buy) or USDT received (sell)
     error: Optional[str] = None
 
 
@@ -322,8 +323,11 @@ class TwakClient:
         display = self._mask_password(cmd)
         log.debug("TWAK: %s", " ".join(display))
         try:
+            env = os.environ.copy()
+            if self._wallet_password:
+                env["TWAK_WALLET_PASSWORD"] = self._wallet_password
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=timeout,
+                cmd, capture_output=True, text=True, timeout=timeout, env=env,
             )
         except FileNotFoundError:
             raise RuntimeError(
@@ -372,6 +376,50 @@ class TwakClient:
             if key.upper() == sym_upper:
                 return val
         return symbol
+
+    def quote_swap(
+        self,
+        *,
+        from_token: str,
+        to_token: str,
+        amount_token: float = 0,
+        amount_usd: float = 0,
+        slippage: float = 5,
+    ) -> float:
+        """Get a DEX quote without executing. Returns token count received.
+
+        Uses `twak swap --quote-only --json` and parses the "output" field.
+        For buys (--usd): returns tokens of to_token received.
+        For sells: returns USDT received.
+
+        Returns 0.0 if quote fails.
+        """
+        from_resolved = self._resolve_token(from_token)
+        to_resolved = self._resolve_token(to_token)
+        is_buy = amount_usd > 0
+
+        cmd = ["swap", "--chain", BSC_CHAIN, "--slippage", str(slippage),
+               "--quote-only", "--json"]
+        if is_buy:
+            cmd += ["--usd", str(amount_usd), from_resolved, to_resolved]
+        else:
+            cmd += [str(amount_token), from_resolved, to_resolved]
+
+        try:
+            result = self._run_twak(cmd, timeout=15)
+            import json
+            data = json.loads(result.stdout)
+            raw_output = data.get("output", "0")
+            # "output" may be "<amount> <symbol>" or just "<amount>"
+            try:
+                output = float(raw_output.split()[0])
+            except (ValueError, IndexError):
+                output = 0.0
+            parsed = self._parse_output_amount(result.stdout, is_buy)
+            return parsed or output
+        except Exception as exc:
+            log.debug("quote_swap failed for %s→%s: %s", from_token, to_token, exc)
+            return 0.0
 
     def execute_swap(self, instruction) -> TradeResult:
         """
@@ -464,6 +512,8 @@ class TwakClient:
             result = self._run_twak(cmd, timeout=SWAP_TIMEOUT_SECONDS)
             # Parse tx hash from TWAK output
             tx_hash = self._parse_tx_hash(result.stdout)
+            # Parse actual output amount from TWAK stdout line
+            output_amount = self._parse_output_amount(result.stdout, is_buy)
             # Show contract address for tokens TWAK resolves to address
             extra = ""
             if from_resolved.startswith("0x") and from_resolved != from_tok:
@@ -471,13 +521,15 @@ class TwakClient:
             elif to_resolved.startswith("0x") and to_resolved != to_tok:
                 extra = f" ({to_resolved})"
             log.info(
-                "EXECUTED: %s %.6f %s%s → %s | tx=%s",
-                action.upper(), effective_amount, from_tok, extra, to_tok, tx_hash,
+                "EXECUTED: %s %.6f %s%s → %s | actual_out=%.6f | tx=%s",
+                action.upper(), effective_amount, from_tok, extra, to_tok,
+                output_amount, tx_hash,
             )
             return TradeResult(
                 success=True, tx_hash=tx_hash,
                 from_token=from_tok, to_token=to_tok,
                 amount_token=effective_amount,
+                output_amount=output_amount,
             )
 
         except RuntimeError as exc:
@@ -502,6 +554,29 @@ class TwakClient:
         import re
         m = re.search(r'(0x[a-fA-F0-9]{64})', stdout)
         return m.group(1) if m else None
+
+    def _parse_output_amount(self, stdout: str, is_buy: bool) -> float:
+        """Extract actual output amount from TWAK swap stdout.
+
+        TWAK output format:
+          Buy:  "Swapping 25.14 USDT -> 1891.000000 SAHARA via 0x"
+          Sell: "Swapping 273.49 SIREN -> 11.67 USDT via LiquidMesh"
+
+        For buys: returns token count received.
+        For sells: returns USDT received.
+        """
+        import re
+        # Match: Swapping <amount> <token> -> <amount> <token> via <provider>
+        m = re.search(
+            r'Swapping\s+[\d.]+\s+\S+\s*->\s*([\d.]+)\s+\S+',
+            stdout,
+        )
+        if m:
+            try:
+                return float(m.group(1))
+            except ValueError:
+                pass
+        return 0.0
 
     # ── Portfolio queries ────────────────────────────────────────────────
 
