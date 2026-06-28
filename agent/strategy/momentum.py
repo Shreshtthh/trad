@@ -42,6 +42,11 @@ def _build_scan_list() -> set[str]:
 
 SCAN_LIST: set[str] = _build_scan_list()
 
+# ── Token blocklist (manual — tokens proven harmful) ──
+# BARD: drained PCS pool, 60%+ impact on $25 buy
+# UB: won't create LP after launch, 50%+ impact / won't execute
+BLOCKLIST: set[str] = {"BARD", "UB"}
+
 # ── Gates ──
 FRICTION_FLOOR_PCT = 1.25       # Must beat round-trip fees (~0.55%) in 1h alone with margin
 MIN_VOLUME_24H = 100_000        # Minimum 24h volume to avoid shallow pools
@@ -144,6 +149,10 @@ def discover_candidates(
         # allowlist case (e.g., "BabyDoge", "XAUt"). Always lookup by upper.
         q = quotes.get(sym.upper())
         if not q:
+            continue
+
+        # Skip blocklisted tokens (proven harmful — empty pools, scams)
+        if sym.upper() in BLOCKLIST:
             continue
 
         # Skip tokens in penalty box
