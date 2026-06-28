@@ -49,6 +49,7 @@ from strategy.regime import classify_regime, RegimeDecision
 from strategy.momentum import discover_candidates
 from strategy.portfolio import generate_swap_plan, SwapPlan
 from data.cmc_client import cmc_fetch_quotes_prices, cmc_fetch_quotes_momentum
+from data.allowlist import is_stablecoin
 
 # ── Logging ──
 logging.basicConfig(
@@ -489,7 +490,8 @@ class Orchestrator:
         # Step 4 — Run guardrails (daily reset, drawdown, inactivity, quota)
         verdict = run_checks(state)
 
-        # Step 5 — SKIP_REBALANCE: nothing to do
+        # Step 5 — SKIP_REBALANCE: quota exhausted, no new positions.
+        # BUT still scan trailing stops — a token can crash while quota is dry.
         if verdict.verdict == Verdict.SKIP_REBALANCE:
             if self._paper_trade:
                 log.info(
@@ -498,7 +500,8 @@ class Orchestrator:
                 )
             else:
                 log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
-                save_state(state, self._state_file)
+                self._tick_exits_only(state, holdings, total_value)
+                # _tick_exits_only handles its own save_state
                 return
         else:
             log.info("Guardrails: %s — %s", verdict.verdict.value, verdict.reason)
@@ -571,12 +574,40 @@ class Orchestrator:
                      c.pct_1h, c.pct_24h, c.vol_24h / 1000, c.reason)
 
         # 7c — Build price cache
-        now = time.monotonic()
-        if not self._price_cache or (now - self._last_price_ts) >= PRICE_REFRESH_SECONDS:
+        now_ts = time.monotonic()
+        if not self._price_cache or (now_ts - self._last_price_ts) >= PRICE_REFRESH_SECONDS:
             self._price_cache = _build_price_cache(
                 holdings, momentum.candidates,
             )
-            self._last_price_ts = now
+            self._last_price_ts = now_ts
+
+        # 7cp — DEX price override for held tokens (trailing stop MUST use real DEX prices)
+        # CMC aggregate price ≠ PancakeSwap pool price. A token can look healthy on
+        # CMC while being 50% down on DEX. Override each holding with a TWAK quote.
+        if not self._paper_trade:
+            for sym, info in holdings.tokens.items():
+                bal = info.get("balance", 0)
+                if bal <= 0 or is_stablecoin(sym) or sym.upper() == "BNB":
+                    continue
+                try:
+                    quote = self._twak.quote_swap(
+                        from_token=sym,
+                        to_token="USDT",
+                        amount_token=bal,
+                        slippage=5,
+                    )
+                    if quote > 0:
+                        dex_price = quote / bal
+                        cmc_price = self._price_cache.get(sym.upper(), 0)
+                        self._price_cache[sym.upper()] = dex_price
+                        if cmc_price > 0 and abs(dex_price - cmc_price) / cmc_price > 0.05:
+                            log.info(
+                                "  DEX price override %s: CMC=$%.4f → DEX=$%.4f (%.0f%% gap)",
+                                sym, cmc_price, dex_price,
+                                (dex_price / cmc_price - 1) * 100,
+                            )
+                except Exception:
+                    pass  # DEX quote failed, keep CMC price
 
         # 7d — Generate swap plan (concentrated: 2 targets, allocation from regime)
         max_pos = self._regime.max_positions if self._regime else 2
@@ -627,6 +658,59 @@ class Orchestrator:
                 log.info("📈 BUY  $%.0f %s%s → %s  (%s)", si.amount_usd, si.from_token, addr_str, si.to_token, si.reason)
             else:
                 log.info("📉 SELL %.0f %s%s → %s  (%s)", si.amount_token, si.from_token, addr_str, si.to_token, si.reason)
+
+        # ── DEX liquidity pre-check: filter buys on shallow pools ──────
+        # CMC volume ≠ DEX liquidity. Before executing, quote each buy on
+        # the actual DEX and reject if price impact > 30% (DEX quote < 70%
+        # of CMC estimate). This prevents draining empty pools like BARD.
+        LIQUIDITY_IMPACT_REJECT = 0.30  # reject if DEX offers <70% of CMC value
+        valid_swaps = []
+        for si in plan.swaps:
+            if si.action != "buy":
+                valid_swaps.append(si)
+                continue
+            try:
+                quote = self._twak.quote_swap(
+                    from_token=si.from_token,
+                    to_token=si.to_token,
+                    amount_usd=si.amount_usd,
+                )
+                if quote <= 0:
+                    log.warning("  ⚠️ No DEX quote for %s — skipping buy", si.to_token)
+                    continue
+                # Compare DEX quote to USD spent
+                received_usd = quote * self._price_cache.get(
+                    si.to_token.upper(),
+                    si.amount_usd / max(si.amount_token, 0.0001),
+                )
+                # For quote_swap returning token count: received_usd = quote * CMC price
+                cmc_price = self._price_cache.get(si.to_token.upper(), 0)
+                if cmc_price > 0:
+                    received_usd = quote * cmc_price
+                    ratio = received_usd / max(si.amount_usd, 1)
+                else:
+                    ratio = 1.0  # no CMC price, let it through
+                if ratio < (1.0 - LIQUIDITY_IMPACT_REJECT):
+                    log.warning(
+                        "  ❌ DEX liquidity check failed: %s buy $%.0f → DEX gives $%.2f "
+                        "(%.0f%% impact). Skipping.",
+                        si.to_token, si.amount_usd, received_usd, (1 - ratio) * 100,
+                    )
+                    continue
+                log.info(
+                    "  ✅ DEX liquidity OK: %s $%.0f → ~$%.2f (%.0f%% impact)",
+                    si.to_token, si.amount_usd, received_usd, (1 - ratio) * 100,
+                )
+            except Exception as exc:
+                log.warning("  ⚠️ DEX quote failed for %s: %s — executing anyway", si.to_token, exc)
+            valid_swaps.append(si)
+        plan.swaps = valid_swaps
+        # ── End liquidity pre-check ──────────────────────────────────
+
+        if not plan.swaps:
+            log.info("All buys rejected by DEX liquidity check — nothing to execute")
+            save_state(state, self._state_file)
+            return
 
         results = self._twak.execute_plan(plan)
         successes = [r for r in results if r.success]
@@ -706,18 +790,40 @@ class Orchestrator:
                     if sym.upper() in _STABLES or sym == "BNB":
                         continue
                     if si.action == "buy":
-                        # Use result.amount_token for the actual received balance
+                        # Use actual DEX fill amount parsed from TWAK stdout.
+                        # result.output_amount = token count from
+                        # "Swapping X USDT -> Y TOKEN via ..." line.
+                        # Falls back to CMC estimate if parsing failed.
                         price = self._price_cache.get(sym.upper(), 0)
-                        received = result.amount_token if result.amount_token > 0 else si.amount_token
+                        received = result.output_amount
+                        if received <= 0:
+                            received = si.amount_token  # CMC estimate fallback
+                        if received <= 0 and price > 0 and si.amount_usd > 0:
+                            received = si.amount_usd / price  # last-resort fallback
+                        # Preserve original entry_ts if adding to an existing position
+                        existing = old.get(sym) or {}
+                        existing_entry = existing.get("entry_ts", "")
+                        # Accumulate balance + cost basis
+                        prev_bal = float(existing.get("balance", 0))
+                        prev_cost = float(existing.get("cost_basis_usd", 0))
                         merged[sym] = {
-                            "balance": received,
-                            "cost_basis_usd": si.amount_usd,
-                            "value_usd": si.amount_usd,
-                            "peak_price": price if price > 0 else (si.amount_usd / received if received > 0 else 0),
-                            "entry_ts": datetime.now(timezone.utc).isoformat(),
+                            "balance": prev_bal + received,
+                            "cost_basis_usd": prev_cost + si.amount_usd,
+                            "value_usd": (prev_cost + si.amount_usd),
+                            "peak_price": max(
+                                price,
+                                float(existing.get("peak_price", 0)),
+                            ),
+                            "entry_ts": existing_entry or datetime.now(timezone.utc).isoformat(),
                         }
+                        log.debug(
+                            "  State tracking: %s +%.6f tokens (DEX=%.6f, CMC=%.6f)",
+                            sym, received, result.output_amount, si.amount_token,
+                        )
                     elif si.action == "sell":
-                        # Token sold — remove from state
+                        # Token sold AND tx confirmed — remove from state.
+                        # (Failed sells are already skipped by the success guard above;
+                        # if we reach here, the chain confirmed the swap.)
                         merged.pop(sym, None)
                         merged.pop(sym.upper(), None)
 
@@ -770,6 +876,30 @@ class Orchestrator:
 
         price_cache = _build_price_cache(holdings, [])
 
+        # Override with DEX prices so trailing stops see real on-chain prices
+        if not self._paper_trade:
+            for sym, info in holdings.tokens.items():
+                bal = info.get("balance", 0)
+                if bal <= 0 or is_stablecoin(sym) or sym.upper() == "BNB":
+                    continue
+                try:
+                    quote = self._twak.quote_swap(
+                        from_token=sym, to_token="USDT",
+                        amount_token=bal, slippage=5,
+                    )
+                    if quote > 0:
+                        dex_price = quote / bal
+                        cmc_price = price_cache.get(sym.upper(), 0)
+                        price_cache[sym.upper()] = dex_price
+                        if cmc_price > 0 and abs(dex_price - cmc_price) / cmc_price > 0.05:
+                            log.warning(
+                                "  DEX override %s: CMC=$%.4f→DEX=$%.4f (%.0f%% gap)",
+                                sym, cmc_price, dex_price,
+                                (dex_price / cmc_price - 1) * 100,
+                            )
+                except Exception:
+                    pass
+
         # Scan each holding for trailing stop violation
         exit_plan = SwapPlan(
             remaining_quota=MAX_TRADES_PER_DAY - state.get("trades_today", 0),
@@ -777,6 +907,10 @@ class Orchestrator:
         now = time.time()
 
         for sym, info in holdings.tokens.items():
+            # Skip stablecoins and BNB — trailing stop is for volatile tokens only
+            if is_stablecoin(sym) or sym.upper() == "BNB":
+                continue
+
             balance = info.get("balance", 0.0)
             if balance <= 0:
                 continue
